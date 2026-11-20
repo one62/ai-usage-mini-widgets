@@ -674,6 +674,7 @@ class BaseUsageWidget:
         load_bundled_fonts()
         self._script_path = script_path
         self.settings = self._load_widget_settings()
+        self._last_saved_state = self._settings_tuple(self.settings)
         self._settings_after_id: str | None = None
         self._settings_ready = False
         self._closing = False
@@ -702,6 +703,8 @@ class BaseUsageWidget:
         self.recovery_after_id: str | None = None
         self._scheduled_after_id: str | None = None
         self._watchdog_after_id: str | None = None
+        self._drain_results_after_id: str | None = None
+        self._hover_after_id: str | None = None
         self.connection_failed = False
         self.last_error = ""
         self.auth_required = False
@@ -709,6 +712,16 @@ class BaseUsageWidget:
         self.autostart = tk.BooleanVar(
             master=self.root,
             value=autostart_enabled_for(self.RUN_VALUE, self._script_path),
+        )
+
+    @staticmethod
+    def _settings_tuple(settings) -> tuple[int, int | None, int | None, bool, bool]:
+        return (
+            settings.transparency,
+            settings.x,
+            settings.y,
+            settings.movement_locked,
+            settings.hover_transparency_enabled,
         )
 
     def _finalize_init(self) -> None:
@@ -719,9 +732,8 @@ class BaseUsageWidget:
         self._bind_actions()
         self._enable_click_through()
         self._settings_ready = True
-        self._update_hover()
+        self._ensure_hover_timer()
         self.refresh()
-        self.root.after(500, self._drain_results)
         self._start_extra_timers()
         self.root.after(60_000, self._update_clock)
 
@@ -753,6 +765,10 @@ class BaseUsageWidget:
     def _render(self, snapshot) -> None:
         raise NotImplementedError
 
+    def _update_time_labels(self) -> None:
+        if self.snapshot:
+            self._render(self.snapshot)
+
     def _cancel_timer(self, attr_name: str) -> None:
         timer_id = getattr(self, attr_name, None)
         if timer_id is not None:
@@ -761,6 +777,10 @@ class BaseUsageWidget:
                 self.root.after_cancel(timer_id)
             except tk.TclError:
                 pass
+
+    def _ensure_drain_results(self) -> None:
+        if getattr(self, "_drain_results_after_id", None) is None and not getattr(self, "_closing", False):
+            self._drain_results_after_id = self.root.after(100, self._drain_results)
 
     def refresh(self) -> None:
         if not self._can_start_refresh():
@@ -778,6 +798,7 @@ class BaseUsageWidget:
             self.reset_compact.configure(text="…", fg=MUTED)
         threading.Thread(target=self._fetch_worker, args=(generation,), daemon=True).start()
         self._watchdog_after_id = self.root.after(50_000, lambda: self._fetch_watchdog(generation))
+        self._ensure_drain_results()
 
     def _fetch_worker(self, generation: int) -> None:
         last_error: Exception | None = None
@@ -806,6 +827,7 @@ class BaseUsageWidget:
         self._handle_connection_error("사용량 조회가 50초를 초과했습니다.")
 
     def _drain_results(self) -> None:
+        self._drain_results_after_id = None
         if getattr(self, "_closing", False):
             return
         try:
@@ -843,8 +865,8 @@ class BaseUsageWidget:
                 pass
             self._handle_connection_error(str(exc) or "렌더링 오류")
         finally:
-            if not getattr(self, "_closing", False):
-                self.root.after(500, self._drain_results)
+            if self.refreshing and not getattr(self, "_closing", False):
+                self._drain_results_after_id = self.root.after(100, self._drain_results)
 
     def _handle_connection_error(self, message: str = "", *, auth_required: bool = False) -> None:
         self.connection_failed = True
@@ -1086,7 +1108,10 @@ class BaseUsageWidget:
         self.root.geometry(f"{width}x{WINDOW_HEIGHT}+{x}+{y}")
 
     def _position_changed(self, event: tk.Event) -> None:
-        if event.widget is self.root:
+        if event.widget is self.root and (self.root.winfo_x(), self.root.winfo_y()) != (
+            self.settings.x,
+            self.settings.y,
+        ):
             self._schedule_settings_save()
 
     def _schedule_settings_save(self) -> None:
@@ -1104,10 +1129,15 @@ class BaseUsageWidget:
         self.settings.movement_locked = self.movement_locked.get()
         self.settings.hover_transparency_enabled = self.hover_transparency_enabled.get()
         self.settings.x, self.settings.y = self.root.winfo_x(), self.root.winfo_y()
+        current_state = self._settings_tuple(self.settings)
+        if current_state == getattr(self, "_last_saved_state", None):
+            return
         try:
             self._save_widget_settings(self.settings)
         except OSError:
             pass
+        else:
+            self._last_saved_state = current_state
 
     def _close(self) -> None:
         if self._closing:
@@ -1117,6 +1147,8 @@ class BaseUsageWidget:
         self._cancel_timer("_scheduled_after_id")
         self._cancel_timer("recovery_after_id")
         self._cancel_timer("_watchdog_after_id")
+        self._cancel_timer("_drain_results_after_id")
+        self._cancel_timer("_hover_after_id")
         self._save_preferences()
         self.root.destroy()
 
@@ -1235,7 +1267,7 @@ class BaseUsageWidget:
         except OSError:
             self._stop_mouse_hook()
             raise
-        self.root.after(10, self._drain_mouse_events)
+        self.root.after(50, self._drain_mouse_events)
 
     def _run_mouse_hook(self) -> None:
         """Pump hook messages independently of Tk redraws and modal menus."""
@@ -1282,7 +1314,11 @@ class BaseUsageWidget:
 
     def _mouse_hook(self, code: int, message: int, data: int) -> int:
         # No Tk calls or popup work in the hook: Windows requires a quick return.
-        if code >= 0 and message in (0x200, 0x201, 0x204, 0x205, 0x207, 0x20B):
+        if code < 0:
+            return self._input_api.CallNextHookEx(None, code, message, data)
+        if message == 0x200 and not self._right_captured:
+            return self._input_api.CallNextHookEx(None, code, message, data)
+        if message in (0x200, 0x201, 0x204, 0x205, 0x207, 0x20B):
             point = ctypes.cast(data, ctypes.POINTER(_MouseHookData)).contents.pt
             x, y = point.x, point.y
             if self._menu_open:
@@ -1327,8 +1363,25 @@ class BaseUsageWidget:
         self._mouse_events.put(("dismiss", x, y))
 
     def _drain_mouse_events(self) -> None:
-        while not self._mouse_events.empty():
-            action, x, y = self._mouse_events.get_nowait()
+        if getattr(self, "_closing", False):
+            return
+        pending_move: tuple[int, int] | None = None
+        while True:
+            try:
+                action, x, y = self._mouse_events.get_nowait()
+            except queue.Empty:
+                break
+            if action == "move":
+                if self.drag_origin is not None:
+                    dx, dy = abs(x - self._right_start[0]), abs(y - self._right_start[1])
+                    if dx >= self._drag_threshold[0] or dy >= self._drag_threshold[1]:
+                        self._dragged = True
+                    if self._dragged and not self.movement_locked.get():
+                        pending_move = (x, y)
+                continue
+            if pending_move is not None:
+                self._move_widget(*pending_move)
+                pending_move = None
             if action == "dismiss":
                 self.menu.close()
             elif action == "down":
@@ -1345,7 +1398,14 @@ class BaseUsageWidget:
                     self.drag_origin = None
                     if not self._dragged:
                         self._show_menu(x, y)
-        self.root.after(10, self._drain_mouse_events)
+        if pending_move is not None:
+            self._move_widget(*pending_move)
+        active = (
+            self.drag_origin is not None
+            or getattr(self, "_right_captured", False)
+            or getattr(self, "_menu_open", False)
+        )
+        self.root.after(10 if active else 50, self._drain_mouse_events)
 
     def _move_widget(self, pointer_x: int, pointer_y: int) -> None:
         x = pointer_x - self.drag_origin[0]
@@ -1358,9 +1418,13 @@ class BaseUsageWidget:
 
     def _show_menu(self, x: int, y: int) -> None:
         self._update_connection_status()
+        self._on_menu_opening()
         self.menu.show(x, y)
         self._menu_hwnd = self._input_api.GetAncestor(self.menu.window.winfo_id(), 2)
         self._menu_open = True
+
+    def _on_menu_opening(self) -> None:
+        pass
 
     def _menu_closed(self) -> None:
         self._menu_open = False
@@ -1373,6 +1437,7 @@ class BaseUsageWidget:
 
     def _toggle_topmost(self) -> None:
         self.root.attributes("-topmost", self.always_on_top.get())
+        self._ensure_hover_timer()
 
     def _ensure_topmost(self) -> None:
         """Restore native WS_EX_TOPMOST if enabled and unexpectedly cleared."""
@@ -1403,10 +1468,32 @@ class BaseUsageWidget:
     def _toggle_hover_transparency(self) -> None:
         self._apply_transparency(self.transparency.get())
         self._schedule_settings_save()
+        self._ensure_hover_timer()
+
+    def _needs_hover_polling(self) -> bool:
+        return bool(self.hover_transparency_enabled.get() or self.always_on_top.get())
+
+    def _ensure_hover_timer(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if self._needs_hover_polling():
+            if getattr(self, "_hover_after_id", None) is None:
+                self._update_hover()
+        else:
+            self._cancel_timer("_hover_after_id")
+            if self._hovered:
+                self._hovered = False
+                self._apply_transparency(self.transparency.get())
 
     def _update_hover(self) -> None:
         """Poll coordinates because the click-through window receives no enter events."""
+        self._hover_after_id = None
         if self._closing:
+            return
+        if not self._needs_hover_polling():
+            if self._hovered:
+                self._hovered = False
+                self._apply_transparency(self.transparency.get())
             return
         x, y = self.root.winfo_pointerxy()
         left, top = self.root.winfo_rootx(), self.root.winfo_rooty()
@@ -1419,7 +1506,7 @@ class BaseUsageWidget:
             self._apply_transparency(self.transparency.get())
             if hovered and not self._menu_open and self.always_on_top.get():
                 self.root.attributes("-topmost", True)
-        self.root.after(50, self._update_hover)
+        self._hover_after_id = self.root.after(80, self._update_hover)
 
     def _toggle_autostart(self) -> None:
         try:
@@ -1450,9 +1537,11 @@ class BaseUsageWidget:
         self.refresh()
 
     def _update_clock(self) -> None:
+        if getattr(self, "_closing", False):
+            return
         self._ensure_topmost()
         if self.snapshot:
-            self._render(self.snapshot)
+            self._update_time_labels()
         self._render_connection_issue()
         self.root.after(60_000, self._update_clock)
 

@@ -95,6 +95,42 @@ class UsageWidget(BaseUsageWidget):
         except OSError:
             webbrowser.open("https://gemini.google.com/")
 
+    def _on_menu_opening(self) -> None:
+        self._update_claude_reset_labels()
+
+    def _update_claude_reset_labels(self) -> None:
+        snapshot = self.snapshot
+        if snapshot is None:
+            return
+        c5 = snapshot.claude_gpt_five_hour
+        if c5 is not None:
+            self.menu.entryconfigure(
+                self.claude_5h_index,
+                right_text=reset_short(c5.resets_at) if c5.resets_at is not None else "",
+            )
+        c7 = snapshot.claude_gpt_seven_day
+        if c7 is not None:
+            self.menu.entryconfigure(
+                self.claude_7d_index,
+                right_text=reset_short(c7.resets_at, weekly=True) if c7.resets_at is not None else "",
+            )
+
+    def _update_time_labels(self) -> None:
+        snapshot = self.snapshot
+        if snapshot is None:
+            return
+        five = snapshot.five_hour
+        self.reset_compact.configure(
+            text=reset_short(five.resets_at) if five else "—",
+            fg=MUTED,
+        )
+        week = snapshot.seven_day
+        self.week_reset.configure(
+            text=reset_short(week.resets_at if week else None, weekly=True)
+        )
+        if getattr(self.menu, "open", False):
+            self._update_claude_reset_labels()
+
     def _render(self, snapshot: UsageSnapshot) -> None:
         five = snapshot.five_hour
         if five:
@@ -157,7 +193,6 @@ class UsageWidget(BaseUsageWidget):
                 label="Claude·GPT 주간: —",
                 right_text="",
             )
-        self._fit_content_width()
 
 
 def main() -> None:

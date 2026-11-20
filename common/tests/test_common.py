@@ -176,6 +176,14 @@ class CommonHelpersTests(unittest.TestCase):
         widget._render = mock.Mock(side_effect=RuntimeError("bad render"))
 
         widget.results.put((1, "ok", "stale"))
+        widget._drain_results()
+        # Still refreshing after skipping stale item -> keeps polling at 100ms
+        self.assertTrue(widget.refreshing)
+        self.assertTrue(
+            any(call.args == (100, widget._drain_results) for call in widget.root.after.call_args_list)
+        )
+
+        widget.root.after.reset_mock()
         widget.results.put((2, "ok", "fresh"))
         widget._drain_results()
 
@@ -183,9 +191,52 @@ class CommonHelpersTests(unittest.TestCase):
         self.assertFalse(widget.refreshing)
         self.assertTrue(widget.connection_failed)
         self.assertIn("bad render", widget.last_error)
-        self.assertTrue(
-            any(call.args == (500, widget._drain_results) for call in widget.root.after.call_args_list)
+        # Idle after completion -> does not keep polling _drain_results
+        self.assertFalse(
+            any(call.args[1] == widget._drain_results for call in widget.root.after.call_args_list)
         )
+
+    def test_save_preferences_skips_disk_write_when_unchanged(self):
+        widget = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget.settings = WidgetSettings(transparency=30, x=100, y=50)
+        widget._last_saved_state = widget._settings_tuple(widget.settings)
+        widget.transparency = mock.Mock()
+        widget.transparency.get.return_value = 30
+        widget.movement_locked = mock.Mock()
+        widget.movement_locked.get.return_value = False
+        widget.hover_transparency_enabled = mock.Mock()
+        widget.hover_transparency_enabled.get.return_value = True
+        widget.root = mock.Mock()
+        widget.root.winfo_x.return_value = 100
+        widget.root.winfo_y.return_value = 50
+        widget._save_widget_settings = mock.Mock()
+
+        widget._save_preferences()
+        widget._save_widget_settings.assert_not_called()
+
+        widget.root.winfo_x.return_value = 200
+        widget._save_preferences()
+        widget._save_widget_settings.assert_called_once()
+        widget._save_preferences()
+        widget._save_widget_settings.assert_called_once()
+
+    def test_hover_polling_stops_when_hover_and_topmost_disabled(self):
+        widget = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget.root = mock.Mock()
+        widget._closing = False
+        widget._hovered = True
+        widget._hover_after_id = "hover-1"
+        widget.transparency = mock.Mock()
+        widget.transparency.get.return_value = 30
+        widget.hover_transparency_enabled = mock.Mock()
+        widget.hover_transparency_enabled.get.return_value = False
+        widget.always_on_top = mock.Mock()
+        widget.always_on_top.get.return_value = False
+
+        widget._ensure_hover_timer()
+        widget.root.after_cancel.assert_called_once_with("hover-1")
+        widget.root.after.assert_not_called()
+        self.assertFalse(widget._hovered)
 
     def test_hover_transparency_does_not_brighten_when_base_transparency_over_80(self):
         widget = BaseUsageWidget.__new__(BaseUsageWidget)
@@ -281,6 +332,29 @@ class MouseGestureTests(unittest.TestCase):
         self.widget._show_menu.assert_not_called()
         self.assertEqual(self.widget._move_widget.call_count, 2)
         self.assertIsNone(self.widget.drag_origin)
+
+    def test_consecutive_drag_moves_are_coalesced_and_adaptive_interval(self):
+        self.gesture(
+            ("down", 110, 110),
+            ("move", 120, 120),
+            ("move", 140, 140),
+            ("move", 200, 220),
+        )
+        self.widget._move_widget.assert_called_once_with(200, 220)
+        self.widget.root.after.assert_called_with(10, self.widget._drain_mouse_events)
+
+        self.widget.root.after.reset_mock()
+        self.gesture(("up", 200, 220))
+        self.widget.root.after.assert_called_with(50, self.widget._drain_mouse_events)
+
+    def test_mouse_hook_fast_path_skips_pointer_cast_on_idle_move(self):
+        widget = self.widget
+        widget._input_api = mock.Mock()
+        widget._input_api.CallNextHookEx.return_value = 42
+        widget._right_captured = False
+        widget._menu_open = False
+        # Passing 0 as data pointer would crash if ctypes.cast(...).contents were dereferenced.
+        self.assertEqual(widget._mouse_hook(0, 0x200, 0), 42)
 
     def test_release_position_alone_can_identify_drag(self):
         self.gesture(("down", 110, 110), ("up", 210, 210))

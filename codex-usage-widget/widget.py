@@ -61,6 +61,7 @@ class UsageWidget(BaseUsageWidget):
             self.pending_reset = None
             self.reset_state_unreadable = True
         self.reset_results: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._reset_drain_after_id: str | None = None
         self._build()
         self._finalize_init()
 
@@ -70,8 +71,9 @@ class UsageWidget(BaseUsageWidget):
     def _save_widget_settings(self, settings) -> None:
         save_settings(settings)
 
-    def _start_extra_timers(self) -> None:
-        self.root.after(500, self._drain_reset_results)
+    def _close(self) -> None:
+        self._cancel_timer("_reset_drain_after_id")
+        super()._close()
 
     def _can_start_refresh(self) -> bool:
         return not self.refreshing and not self.resetting
@@ -222,6 +224,11 @@ class UsageWidget(BaseUsageWidget):
         self.menu.entryconfigure(0, state="disabled")
         self._update_reset_menu()
         threading.Thread(target=self._reset_worker, args=(request,), daemon=True).start()
+        self._ensure_drain_reset_results()
+
+    def _ensure_drain_reset_results(self) -> None:
+        if getattr(self, "_reset_drain_after_id", None) is None and not getattr(self, "_closing", False):
+            self._reset_drain_after_id = self.root.after(100, self._drain_reset_results)
 
     def _reset_worker(self, request: PendingReset) -> None:
         try:
@@ -232,10 +239,14 @@ class UsageWidget(BaseUsageWidget):
             self.reset_results.put(("error", ""))
 
     def _drain_reset_results(self) -> None:
+        self._reset_drain_after_id = None
+        if getattr(self, "_closing", False):
+            return
         try:
             kind, payload = self.reset_results.get_nowait()
         except queue.Empty:
-            self.root.after(500, self._drain_reset_results)
+            if self.resetting:
+                self._reset_drain_after_id = self.root.after(100, self._drain_reset_results)
             return
         self.resetting = False
         self.menu.entryconfigure(0, state="normal")
@@ -253,7 +264,11 @@ class UsageWidget(BaseUsageWidget):
                 "noCredit": "사용 가능한 리셋권이 없습니다.",
             }
             self.refresh()
-            messagebox.showinfo("사용량 리셋권", messages[str(payload)], parent=self.root)
+            messagebox.showinfo(
+                "사용량 리셋권",
+                messages.get(str(payload), "리셋권 처리가 완료되었습니다."),
+                parent=self.root,
+            )
             self._ensure_topmost()
         else:
             self._update_reset_menu()
@@ -264,7 +279,20 @@ class UsageWidget(BaseUsageWidget):
                 parent=self.root,
             )
             self._ensure_topmost()
-        self.root.after(500, self._drain_reset_results)
+
+    def _update_time_labels(self) -> None:
+        snapshot = self.snapshot
+        if snapshot is None:
+            return
+        primary = snapshot.primary
+        self.reset_compact.configure(
+            text=reset_short(primary.resets_at) if primary else "—",
+            fg=MUTED,
+        )
+        secondary = snapshot.secondary
+        self.week_reset.configure(
+            text=reset_short(secondary.resets_at if secondary else None, weekly=True)
+        )
 
     def _render(self, snapshot: UsageSnapshot) -> None:
         primary = snapshot.primary
@@ -312,7 +340,6 @@ class UsageWidget(BaseUsageWidget):
             right_text=f"크레딧: {credit_text}",
         )
         self._update_reset_menu()
-        self._fit_content_width()
 
 
 def main() -> None:
