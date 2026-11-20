@@ -375,7 +375,8 @@ class MouseGestureTests(unittest.TestCase):
             return 1
 
         widget._input_api.GetWindowRect.side_effect = rectangle
-        widget._input_api.GetAsyncKeyState.return_value = -32768  # VK_RBUTTON held
+        # Windows can report zero after the hook swallows the right-down event.
+        widget._input_api.GetAsyncKeyState.return_value = 0
 
         def send(message, x=110, y=110, code=0):
             data = _MouseHookData()
@@ -392,27 +393,34 @@ class MouseGestureTests(unittest.TestCase):
         self.assertEqual(send(0x200, 600, 500), 42)
         self.assertEqual(send(0x205, 600, 500), 1)
         self.assertFalse(widget._right_captured)
-        self.assertEqual(widget._mouse_events.qsize(), 3)
+        self.assertEqual(widget._mouse_events.get_nowait(), ("down", 110, 110))
+        self.assertEqual(widget._mouse_events.get_nowait(), ("move", 600, 500))
+        self.assertEqual(widget._mouse_events.get_nowait(), ("up", 600, 500))
+        self.assertTrue(widget._mouse_events.empty())
         widget._menu_open = True
         widget._dismiss_menu_outside = mock.Mock()
         for message in (0x201, 0x204, 0x207, 0x20B):
             self.assertEqual(send(message), 42)
         self.assertEqual(widget._dismiss_menu_outside.call_count, 4)
 
-    def test_hook_recovers_if_right_button_released_over_elevated_window(self):
+    def test_new_right_down_cancels_gesture_if_previous_up_was_lost(self):
         widget = self.widget
         widget._input_api = mock.Mock()
         widget._input_api.CallNextHookEx.return_value = 42
-        widget._input_api.GetAsyncKeyState.return_value = 0  # VK_RBUTTON not pressed
+        widget._input_api.IsWindowVisible.return_value = 0
         widget._input_hwnd = 1
         widget._right_captured = True
         widget._menu_open = False
+        self.gesture(("down", 110, 110))
 
         data = _MouseHookData()
         data.pt.x, data.pt.y = 300, 300
-        self.assertEqual(widget._mouse_hook(0, 0x200, ctypes.addressof(data)), 42)
+        self.assertEqual(widget._mouse_hook(0, 0x204, ctypes.addressof(data)), 42)
         self.assertFalse(widget._right_captured)
-        self.assertEqual(widget._mouse_events.get_nowait(), ("up", 300, 300))
+        widget._drain_mouse_events()
+        self.assertIsNone(widget.drag_origin)
+        widget._move_widget.assert_not_called()
+        widget._show_menu.assert_not_called()
 
     def test_destroy_unhooks_only_for_root(self):
         self.widget._hook_thread = mock.Mock()

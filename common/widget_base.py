@@ -621,7 +621,6 @@ class BaseUsageWidget:
         )
         signatures = {
             "GetAncestor": ([ctypes.c_void_p, ctypes.c_uint], ctypes.c_void_p),
-            "GetAsyncKeyState": ([ctypes.c_int], ctypes.c_short),
             "GetSystemMetrics": ([ctypes.c_int], ctypes.c_int),
             "GetWindowLongW": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_long),
             "SetWindowLongW": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_long], ctypes.c_long),
@@ -754,7 +753,7 @@ class BaseUsageWidget:
                 if self._right_captured:
                     # A previous WM_RBUTTONUP was lost (e.g., released over an elevated window).
                     self._right_captured = False
-                    self._mouse_events.put(("up", x, y))
+                    self._mouse_events.put(("cancel", x, y))
                 rect = _Rect()
                 if (
                     self._input_api.IsWindowVisible(self._input_hwnd)
@@ -771,12 +770,7 @@ class BaseUsageWidget:
                     self._mouse_events.put(("up", x, y))
                     return 1
                 if message == 0x200:
-                    key_state = self._input_api.GetAsyncKeyState(0x02)  # VK_RBUTTON
-                    if isinstance(key_state, int) and not (key_state & 0x8000):
-                        self._right_captured = False
-                        self._mouse_events.put(("up", x, y))
-                    else:
-                        self._mouse_events.put(("move", x, y))
+                    self._mouse_events.put(("move", x, y))
         return self._input_api.CallNextHookEx(None, code, message, data)
 
     def _dismiss_menu_outside(self, x: int, y: int) -> None:
@@ -809,6 +803,8 @@ class BaseUsageWidget:
                 pending_move = None
             if action == "dismiss":
                 self.menu.close()
+            elif action == "cancel":
+                self.drag_origin = None
             elif action == "down":
                 self._right_start = (x, y)
                 self.drag_origin = (x - self.root.winfo_x(), y - self.root.winfo_y())
