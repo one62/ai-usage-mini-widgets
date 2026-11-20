@@ -52,7 +52,7 @@ class CommonHelpersTests(unittest.TestCase):
 
     def test_reset_short_formats_compact_ranges(self):
         self.assertEqual(reset_short(None), "—")
-        with mock.patch("common.widget_base.time.time", return_value=1_000_000.0):
+        with mock.patch("common.formatting.time.time", return_value=1_000_000.0):
             self.assertEqual(reset_short(1_000_000), "now")
             self.assertEqual(reset_short(1_000_000 + 86_400), "24h 0m")
             self.assertEqual(reset_short(1_000_000 + 90_000), "1d 1h")

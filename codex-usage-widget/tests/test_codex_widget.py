@@ -3,6 +3,7 @@ import os
 import queue
 import sys
 import tempfile
+import time
 import tkinter as tk
 import unittest
 from decimal import Decimal
@@ -16,9 +17,10 @@ for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+import codex_settings
 import codex_usage
-import widget as codex_widget_module
-import widget_settings
+import codex_widget
+from codex_settings import PendingReset, load_pending_reset, save_pending_reset
 from codex_usage import (
     AuthRequiredError,
     UsageError,
@@ -31,9 +33,8 @@ from codex_usage import (
     parse_rate_limits,
     query_usage,
 )
+from codex_widget import UsageWidget
 from common.widget_base import enable_dpi_awareness, load_bundled_fonts
-from widget import UsageWidget
-from widget_settings import PendingReset, load_pending_reset, save_pending_reset
 
 
 class ParseRateLimitsTests(unittest.TestCase):
@@ -90,7 +91,7 @@ class ParseRateLimitsTests(unittest.TestCase):
     def test_pending_reset_persistence_roundtrip_and_clear(self):
         with tempfile.TemporaryDirectory() as temp:
             fake_settings = Path(temp) / "settings.json"
-            with mock.patch.object(widget_settings, "settings_path", return_value=fake_settings):
+            with mock.patch.object(codex_settings, "settings_path", return_value=fake_settings):
                 self.assertIsNone(load_pending_reset())
                 pending = PendingReset(key="req-1", executable=r"C:\codex.exe", credit_id="cred-1")
                 save_pending_reset(pending)
@@ -102,7 +103,7 @@ class ParseRateLimitsTests(unittest.TestCase):
         stream = [json.dumps({"id": 2, "error": {"message": "401 Unauthorized"}}) + "\n"]
         reader = _LineReader(stream)
         with self.assertRaises(AuthRequiredError):
-            _wait_for_id(reader, 2, deadline=10**12)
+            _wait_for_id(reader, 2, deadline=time.monotonic() + 5.0)
 
         with mock.patch("codex_usage.find_codex_executables", return_value=[r"C:\codex.exe"]):
             with mock.patch.object(
@@ -158,12 +159,12 @@ class ParseRateLimitsTests(unittest.TestCase):
     def test_token_limit_error_is_not_misclassified_as_auth_and_auth_message_preserved(self):
         reader = _LineReader([json.dumps({"id": 2, "error": {"message": "max token limit exceeded"}}) + "\n"])
         with self.assertRaises(UsageError) as ctx:
-            _wait_for_id(reader, 2, deadline=10**12)
+            _wait_for_id(reader, 2, deadline=time.monotonic() + 5.0)
         self.assertNotIsInstance(ctx.exception, AuthRequiredError)
 
         reader2 = _LineReader([json.dumps({"id": 2, "error": {"message": "access token expired"}}) + "\n"])
         with self.assertRaises(AuthRequiredError):
-            _wait_for_id(reader2, 2, deadline=10**12)
+            _wait_for_id(reader2, 2, deadline=time.monotonic() + 5.0)
 
         codex_usage._set_cached_executable(None)
         with mock.patch("codex_usage.find_codex_executables", return_value=[r"C:\first.exe", r"C:\second.exe"]):
@@ -220,7 +221,7 @@ class ParseRateLimitsTests(unittest.TestCase):
         widget._update_reset_menu = mock.Mock()
 
         widget.reset_results.put(("error", ""))
-        with mock.patch.object(codex_widget_module.messagebox, "showwarning"):
+        with mock.patch.object(codex_widget.messagebox, "showwarning"):
             widget._drain_reset_results()
         self.assertFalse(widget.resetting)
         self.assertIsNotNone(widget.pending_reset)
@@ -228,8 +229,8 @@ class ParseRateLimitsTests(unittest.TestCase):
 
         widget.resetting = True
         widget.reset_results.put(("ok", "reset"))
-        with mock.patch.object(codex_widget_module, "save_pending_reset") as save_mock:
-            with mock.patch.object(codex_widget_module.messagebox, "showinfo"):
+        with mock.patch.object(codex_widget, "save_pending_reset") as save_mock:
+            with mock.patch.object(codex_widget.messagebox, "showinfo"):
                 widget._drain_reset_results()
         save_mock.assert_called_once_with(None)
         self.assertIsNone(widget.pending_reset)

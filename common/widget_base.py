@@ -1,666 +1,85 @@
-"""Shared UI, Win32 helpers, popup menu, and base widget for usage widgets."""
+"""Shared base widget class and public facade for usage widgets."""
 
 from __future__ import annotations
 
-import atexit
 import ctypes
-import os
 import queue
-import sys
 import threading
 import time
 import tkinter as tk
-import winreg
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox
-from typing import Callable
 
-
-BG = "#222127"
-TEXT = "#FFFFFF"
-MUTED = "#C6C3CE"
-TRACK = "#424149"
-YELLOW = "#F9E29C"
-GRADIENT_STOPS = (
-    (0.00, "#A5E9C1"),
-    (0.28, "#A3E1F7"),
-    (0.55, "#F9E29C"),
-    (0.78, "#F7C697"),
-    (1.00, "#F6AEAE"),
+from common.formatting import (
+    BG,
+    BOLD_FONT_FAMILY,
+    FONT_FAMILY,
+    GRADIENT_STOPS,
+    MUTED,
+    RECOVERY_DELAYS,
+    TEXT,
+    TRACK,
+    WINDOW_HEIGHT,
+    WINDOW_WIDTH,
+    YELLOW,
+    gradient_color,
+    recovery_delay,
+    reset_short,
+    usage_color,
 )
-WINDOW_WIDTH = 270
-WINDOW_HEIGHT = 38
-FONT_FAMILY = "NEXON Football Gothic L"
-BOLD_FONT_FAMILY = "NEXON Football Gothic B"
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RECOVERY_DELAYS = (15, 30, 60, 120, 300)
-
-DEFAULT_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
-
-
-_USER32_CACHE: ctypes.WinDLL | None = None
-
-
-def _get_user32() -> ctypes.WinDLL:
-    global _USER32_CACHE
-    if _USER32_CACHE is None:
-        api = ctypes.WinDLL("user32", use_last_error=True)
-        api.MonitorFromRect.argtypes = [ctypes.POINTER(_Rect), ctypes.c_ulong]
-        api.MonitorFromRect.restype = ctypes.c_void_p
-        api.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MonitorInfo)]
-        api.GetMonitorInfoW.restype = ctypes.c_int
-        api.GetSystemMetrics.argtypes = [ctypes.c_int]
-        api.GetSystemMetrics.restype = ctypes.c_int
-        api.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        api.GetAncestor.restype = ctypes.c_void_p
-        api.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
-        api.MessageBoxW.restype = ctypes.c_int
-        _USER32_CACHE = api
-    return _USER32_CACHE
-
-
-def _resolve_top_level_hwnd(hwnd: int) -> int:
-    if os.name != "nt" or not hwnd:
-        return hwnd
-    try:
-        root_hwnd = _get_user32().GetAncestor(hwnd, 2)  # GA_ROOT
-        return int(root_hwnd) if root_hwnd else hwnd
-    except (AttributeError, OSError):
-        return hwnd
-
-
-def _show_native_info(title: str, message: str) -> None:
-    if os.name == "nt":
-        try:
-            _get_user32().MessageBoxW(None, message, title, 0x40)  # MB_OK | MB_ICONINFORMATION
-            return
-        except (AttributeError, OSError):
-            pass
-    root = tk.Tk()
-    root.withdraw()
-    try:
-        messagebox.showinfo(title, message, parent=root)
-    finally:
-        root.destroy()
-
-
-def load_bundled_fonts(font_directory: Path | None = None) -> None:
-    """Register bundled Nexon Football Gothic fonts privately for this process."""
-    if os.name != "nt":
-        return
-    target_dir = font_directory or DEFAULT_FONT_DIR
-    gdi32 = ctypes.WinDLL("gdi32")
-    gdi32.AddFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
-    gdi32.AddFontResourceExW.restype = ctypes.c_int
-    gdi32.RemoveFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
-    gdi32.RemoveFontResourceExW.restype = wintypes.BOOL
-    private_font = 0x10  # FR_PRIVATE: available only to this process.
-    for filename in ("NEXONFootballGothic-Light.otf", "NEXONFootballGothic-Bold.otf"):
-        path = str(target_dir / filename)
-        if gdi32.AddFontResourceExW(path, private_font, None):
-            atexit.register(gdi32.RemoveFontResourceExW, path, private_font, None)
-
-
-def recovery_delay(failure_count: int) -> int:
-    """Return a bounded backoff while continuing to retry forever."""
-    return RECOVERY_DELAYS[min(max(1, failure_count) - 1, len(RECOVERY_DELAYS) - 1)]
-
-
-class _Rect(ctypes.Structure):
-    _fields_ = [
-        ("left", ctypes.c_long),
-        ("top", ctypes.c_long),
-        ("right", ctypes.c_long),
-        ("bottom", ctypes.c_long),
-    ]
-
-
-class _MouseHookData(ctypes.Structure):
-    _fields_ = [
-        ("pt", wintypes.POINT),
-        ("mouseData", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
-class _MonitorInfo(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.c_ulong),
-        ("rcMonitor", _Rect),
-        ("rcWork", _Rect),
-        ("dwFlags", ctypes.c_ulong),
-    ]
-
-
-def clamp_position(
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-    area: tuple[int, int, int, int],
-) -> tuple[int, int]:
-    """Keep the entire widget inside a monitor's usable area."""
-    left, top, right, bottom = area
-    return (
-        max(left, min(x, right - width)),
-        max(top, min(y, bottom - height)),
-    )
-
-
-def monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int, int, int]:
-    """Return the nearest monitor work area, excluding the Windows taskbar."""
-    if os.name != "nt":
-        return (0, 0, max(width, x + width), max(height, y + height))
-    try:
-        user32 = _get_user32()
-        rect = _Rect(x, y, x + width, y + height)
-        monitor = user32.MonitorFromRect(ctypes.byref(rect), 2)  # nearest monitor
-        info = _MonitorInfo()
-        info.cbSize = ctypes.sizeof(_MonitorInfo)
-        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-            work = info.rcWork
-            return (work.left, work.top, work.right, work.bottom)
-        return (0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
-    except (AttributeError, OSError):
-        return (0, 0, max(width, x + width), max(height, y + height))
-
-
-def reset_short(timestamp: int | None, *, weekly: bool = False) -> str:
-    if timestamp is None:
-        return "—"
-    seconds = max(0, timestamp - int(time.time()))
-    if seconds == 0:
-        return "now"
-    total_minutes = seconds // 60
-    days, remainder = divmod(total_minutes, 1440)
-    hours, minutes = divmod(remainder, 60)
-    if weekly:
-        return f"{days}d {hours}h"
-    if total_minutes == 0:
-        return "<1m"
-    if total_minutes == 1440:
-        return "24h 0m"
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
-
-
-def usage_color(used_percent: int) -> str:
-    return gradient_color(max(0.0, min(1.0, used_percent / 100)))
-
-
-def _rgb(hex_color: str) -> tuple[int, int, int]:
-    value = hex_color.lstrip("#")
-    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
-
-
-def gradient_color(position: float) -> str:
-    """Return a restrained iOS-style usage color along the configured gradient."""
-    position = max(0.0, min(1.0, position))
-    for index in range(1, len(GRADIENT_STOPS)):
-        left_at, left_color = GRADIENT_STOPS[index - 1]
-        right_at, right_color = GRADIENT_STOPS[index]
-        if position <= right_at:
-            span = right_at - left_at
-            mix = 0.0 if span == 0 else (position - left_at) / span
-            left = _rgb(left_color)
-            right = _rgb(right_color)
-            channels = tuple(round(a + ((b - a) * mix)) for a, b in zip(left, right))
-            return "#{:02X}{:02X}{:02X}".format(*channels)
-    return GRADIENT_STOPS[-1][1]
-
-
-def pythonw_command_for(script_path: Path) -> str:
-    interpreter = Path(sys.executable)
-    pythonw = interpreter.with_name("pythonw.exe")
-    selected = pythonw if pythonw.exists() else interpreter
-    return f'"{selected}" "{script_path.resolve()}"'
-
-
-def autostart_enabled_for(run_value: str, script_path: Path) -> bool:
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            value, _ = winreg.QueryValueEx(key, run_value)
-            return value == pythonw_command_for(script_path)
-    except FileNotFoundError:
-        return False
-
-
-def set_autostart_for(run_value: str, script_path: Path, enabled: bool) -> None:
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-        if enabled:
-            winreg.SetValueEx(key, run_value, 0, winreg.REG_SZ, pythonw_command_for(script_path))
-        else:
-            try:
-                winreg.DeleteValue(key, run_value)
-            except FileNotFoundError:
-                pass
-
-
-def enable_dpi_awareness() -> None:
-    """Use physical pixels for Tk, monitor bounds, and low-level hook points."""
-    if os.name != "nt":
-        return
-    api = ctypes.WinDLL("user32", use_last_error=True)
-    try:
-        api.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
-        api.SetProcessDpiAwarenessContext.restype = ctypes.c_int
-        api.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
-        api.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
-        for context in (-4, -3):  # PER_MONITOR_AWARE_V2, then V1
-            api.SetProcessDpiAwarenessContext(ctypes.c_void_p(context))
-            # Also covers an executable whose manifest already set a default.
-            if api.SetThreadDpiAwarenessContext(ctypes.c_void_p(context)):
-                return
-    except AttributeError:
-        # Early Windows 10 releases lack the context APIs.
-        shcore = ctypes.WinDLL("shcore", use_last_error=True)
-        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
-        shcore.SetProcessDpiAwareness.restype = ctypes.c_long
-        if shcore.SetProcessDpiAwareness(2) in (0, -2147024891):  # S_OK or E_ACCESSDENIED
-            return
-    raise RuntimeError("Could not enable per-monitor DPI awareness")
-
-
-def run_single_instance(
-    mutex_name: str,
-    app_title: str,
-    create_and_run: Callable[[], None],
-) -> None:
-    """Ensure only one instance per named Windows mutex runs at a time."""
-    if os.name != "nt":
-        raise SystemExit("이 위젯은 Windows에서만 실행할 수 있습니다.")
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel.CreateMutexW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.CloseHandle.restype = wintypes.BOOL
-
-    error_already_exists = 183
-    ctypes.set_last_error(0)
-    mutex = kernel.CreateMutexW(None, False, mutex_name)
-    error = ctypes.get_last_error()
-    if not mutex:
-        raise ctypes.WinError(error)
-
-    if error == error_already_exists:
-        kernel.CloseHandle(mutex)
-        _show_native_info(app_title, "위젯이 이미 실행 중입니다.")
-        return
-
-    try:
-        create_and_run()
-    finally:
-        kernel.CloseHandle(mutex)
-
-
-class PopupMenu:
-    """Tk popup with inert information labels and selectable action rows."""
-
-    def __init__(
-        self,
-        root: tk.Tk,
-        on_close: Callable[[], None],
-        *,
-        reserve_indicator_space: bool = False,
-    ) -> None:
-        self.root = root
-        self.on_close = on_close
-        self.reserve_indicator_space = reserve_indicator_space
-        self.font = tkfont.nametofont("TkMenuFont", root=root).copy()
-        self.font.configure(family=FONT_FAMILY)
-        self.background = "#2A3032"
-        self.active_background = "#3A4345"
-        self.window = tk.Toplevel(root)
-        self.window.withdraw()
-        self.window.overrideredirect(True)
-        self.window.attributes("-topmost", True)
-        self.body = tk.Frame(
-            self.window,
-            bg=self.background,
-            highlightbackground="#56525F",
-            highlightthickness=1,
-        )
-        self.body.pack(fill="both", expand=True)
-        self.entries: list[dict] = []
-        self.selected: int | None = None
-        self.open = False
-        self.window.bind("<Escape>", self._escape)
-        self.window.bind("<Up>", lambda event: self._navigate(-1))
-        self.window.bind("<Down>", lambda event: self._navigate(1))
-        self.window.bind("<Return>", self._activate_selected)
-        self.window.bind("<space>", self._activate_selected)
-        self.window.bind("<Left>", lambda event: self._adjust_scale(-1))
-        self.window.bind("<Right>", lambda event: self._adjust_scale(1))
-        self.window.bind("<Home>", lambda event: self._adjust_scale(endpoint=0))
-        self.window.bind("<End>", lambda event: self._adjust_scale(endpoint=100))
-        self.window.bind("<FocusOut>", self._focus_out)
-
-    def _add_row(
-        self,
-        kind: str,
-        label: str,
-        state: str = "normal",
-        command=None,
-        variable: tk.BooleanVar | None = None,
-        right_text: str | None = None,
-    ) -> None:
-        index = len(self.entries)
-        row = tk.Frame(self.body, bg=self.background, bd=0)
-        row.pack(fill="x")
-        indicator = None
-        if self.reserve_indicator_space or kind == "check":
-            indicator = tk.Canvas(
-                row,
-                width=18,
-                height=18,
-                bg=self.background,
-                bd=0,
-                highlightthickness=0,
-            )
-            indicator.pack(side="left", padx=(12, 6))
-        right_widget = None
-        if right_text is not None:
-            right_widget = tk.Label(
-                row,
-                anchor="e",
-                padx=0,
-                pady=6,
-                bg=self.background,
-                bd=0,
-                font=self.font,
-            )
-            right_widget.pack(side="right", padx=(0, 12))
-        text_widget = tk.Label(
-            row,
-            anchor="w",
-            padx=0,
-            pady=6,
-            bg=self.background,
-            bd=0,
-            font=self.font,
-        )
-        text_widget.pack(
-            side="left",
-            fill="both",
-            expand=True,
-            padx=(0 if indicator else 12, 12),
-        )
-        self.entries.append(
-            dict(
-                kind=kind,
-                label=label,
-                state=state,
-                command=command,
-                variable=variable,
-                widget=row,
-                text_widget=text_widget,
-                indicator=indicator,
-                right_widget=right_widget,
-                right_text=right_text,
-            )
-        )
-        if kind != "info":
-            for target in (row, indicator, text_widget, right_widget):
-                if target is not None:
-                    target.bind("<Enter>", lambda event, i=index: self._select(i))
-                    target.bind("<Leave>", lambda event, i=index: self._leave_row(i, event))
-                    target.bind("<ButtonRelease-1>", lambda event, i=index: self._release_row(i, event))
-        # Information labels have no mouse, keyboard, or command bindings.
-        self._render_row(index)
-
-    def add_command(self, *, label: str, command, state: str = "normal") -> None:
-        self._add_row("command", label, state, command)
-
-    def add_info(self, *, label: str, right_text: str | None = None) -> None:
-        self._add_row("info", label, "disabled", right_text=right_text)
-
-    def add_checkbutton(self, *, label: str, variable: tk.BooleanVar, command) -> None:
-        self._add_row("check", label, command=command, variable=variable)
-
-    def add_scale(self, *, label: str, variable: tk.IntVar, command) -> None:
-        index = len(self.entries)
-        row = tk.Frame(self.body, bg=self.background)
-        row.pack(fill="x", padx=12, pady=4)
-        caption = tk.Frame(row, bg=self.background)
-        caption.pack(fill="x")
-        text_widget = tk.Label(
-            caption,
-            text=label,
-            anchor="w",
-            bg=self.background,
-            fg=TEXT,
-            font=self.font,
-        )
-        text_widget.pack(side="left")
-        font = self.font
-        value_box = tk.Frame(
-            caption,
-            bg=self.background,
-            width=font.measure("100%") + 4,
-            height=font.metrics("linespace") + 4,
-        )
-        value_box.pack(side="right")
-        value_box.pack_propagate(False)
-        value_widget = tk.Label(
-            value_box,
-            text=f"{variable.get()}%",
-            anchor="e",
-            bg=self.background,
-            fg=TEXT,
-            font=font,
-        )
-        value_widget.pack(fill="both", expand=True)
-        scale = tk.Scale(
-            row,
-            from_=0,
-            to=100,
-            resolution=1,
-            orient="horizontal",
-            variable=variable,
-            showvalue=False,
-            length=210,
-            width=12,
-            sliderlength=16,
-            bd=0,
-            highlightthickness=0,
-            takefocus=True,
-            bg=self.background,
-            troughcolor="#424149",
-            activebackground="#8CD9F5",
-            command=lambda value, i=index: self._scale_changed(i, value),
-        )
-        scale.pack(fill="x")
-        self.entries.append(
-            dict(
-                kind="scale",
-                label=label,
-                state="normal",
-                command=command,
-                variable=variable,
-                widget=row,
-                text_widget=text_widget,
-                value_widget=value_widget,
-                scale=scale,
-                font=font,
-            )
-        )
-        for target in (row, caption, text_widget, value_widget, scale):
-            target.bind("<Enter>", lambda event, i=index: self._select(i))
-            target.bind("<Leave>", lambda event, i=index: self._leave_row(i, event))
-        scale.bind("<ButtonPress-1>", lambda event, i=index: self._select(i), add="+")
-        scale.bind("<FocusIn>", lambda event, i=index: self._select(i))
-        scale.bind("<Up>", lambda event: self._navigate(-1))
-        scale.bind("<Down>", lambda event: self._navigate(1))
-        scale.bind("<Left>", lambda event: self._adjust_scale(-1))
-        scale.bind("<Right>", lambda event: self._adjust_scale(1))
-        scale.bind("<Home>", lambda event: self._adjust_scale(endpoint=0))
-        scale.bind("<End>", lambda event: self._adjust_scale(endpoint=100))
-        scale.bind("<Return>", self._activate_selected)
-        scale.bind("<space>", self._activate_selected)
-
-    def _scale_changed(self, index: int, value: str) -> None:
-        entry = self.entries[index]
-        number = max(0, min(100, round(float(value))))
-        # Keep the track fixed while dragging, including 9 -> 10 -> 100%.
-        entry["value_widget"].configure(text=f"{number}%")
-        entry["command"](number)
-
-    def _adjust_scale(self, delta: int = 0, *, endpoint: int | None = None) -> str:
-        if self.selected is not None:
-            entry = self.entries[self.selected]
-            if entry["kind"] == "scale":
-                value = endpoint if endpoint is not None else entry["variable"].get() + delta
-                entry["scale"].set(max(0, min(100, value)))
-        return "break"
-
-    def add_separator(self) -> None:
-        line = tk.Frame(self.body, bg="#56525F", height=1)
-        line.pack(fill="x", padx=8, pady=4)
-        self.entries.append(dict(kind="separator", widget=line))
-
-    def index(self, index: str) -> int:
-        if index != "end":
-            raise ValueError("Only the end index is supported")
-        return len(self.entries) - 1
-
-    def entryconfigure(self, index: int, **options) -> None:
-        self.entries[index].update(options)
-        if self.selected == index and not self._enabled(index):
-            self.selected = None
-        self._render_row(index)
-        if self.open:
-            self._fit_window(self.window.winfo_x(), self.window.winfo_y())
-
-    def _enabled(self, index: int) -> bool:
-        entry = self.entries[index]
-        return entry["kind"] in ("command", "check", "scale") and entry["state"] == "normal"
-
-    def _render_row(self, index: int) -> None:
-        entry = self.entries[index]
-        if entry["kind"] == "separator":
-            return
-        if entry["kind"] == "scale":
-            entry["text_widget"].configure(fg=TEXT if self.selected == index else MUTED)
-            return
-        enabled = self._enabled(index)
-        foreground = TEXT if enabled else MUTED
-        background = self.active_background if enabled and self.selected == index else self.background
-        for target in (entry["widget"], entry["text_widget"], entry["indicator"]):
-            if target is not None:
-                target.configure(bg=background, cursor="hand2" if enabled else "arrow")
-        entry["text_widget"].configure(text=entry["label"], fg=foreground)
-        if entry["right_widget"] is not None:
-            entry["right_widget"].configure(
-                text=entry["right_text"],
-                fg=foreground,
-                bg=background,
-            )
-        indicator = entry["indicator"]
-        if indicator is not None:
-            indicator.delete("all")
-            if entry["kind"] == "check":
-                # Draw the check instead of depending on a font's Unicode glyph.
-                indicator.create_rectangle(2, 2, 15, 15, outline=foreground)
-                if entry["variable"].get():
-                    indicator.create_line(4, 8, 7, 11, 13, 5, fill=foreground, width=2)
-
-    @staticmethod
-    def _pointer_inside_widget(widget: tk.Widget, x_root: int, y_root: int) -> bool:
-        left = widget.winfo_rootx()
-        top = widget.winfo_rooty()
-        width = widget.winfo_width() if widget.winfo_width() > 1 else widget.winfo_reqwidth()
-        height = widget.winfo_height() if widget.winfo_height() > 1 else widget.winfo_reqheight()
-        return left <= x_root < left + width and top <= y_root < top + height
-
-    def _leave_row(self, index: int, event: tk.Event) -> None:
-        if self.selected == index and not self._pointer_inside_widget(
-            self.entries[index]["widget"], event.x_root, event.y_root
-        ):
-            self._select(None)
-
-    def _release_row(self, index: int, event: tk.Event) -> None:
-        if self._pointer_inside_widget(self.entries[index]["widget"], event.x_root, event.y_root):
-            self._invoke(index)
-
-    def _select(self, index: int | None) -> None:
-        previous = self.selected
-        self.selected = index if index is not None and self._enabled(index) else None
-        for candidate in (previous, self.selected):
-            if candidate is not None:
-                self._render_row(candidate)
-
-    def _navigate(self, step: int) -> str:
-        choices = [i for i in range(len(self.entries)) if self._enabled(i)]
-        if choices:
-            if self.selected in choices:
-                index = (choices.index(self.selected) + step) % len(choices)
-            else:
-                index = 0 if step > 0 else -1
-            self._select(choices[index])
-        return "break"
-
-    def _activate_selected(self, event: tk.Event) -> str:
-        if self.selected is not None:
-            self._invoke(self.selected)
-        return "break"
-
-    def _invoke(self, index: int) -> None:
-        if not self.open or not self._enabled(index):
-            return
-        entry = self.entries[index]
-        if entry["kind"] == "scale":
-            entry["scale"].focus_set()
-            return
-        self.close()
-        if entry["kind"] == "check":
-            entry["variable"].set(not entry["variable"].get())
-        entry["command"]()
-
-    def show(self, x: int, y: int) -> None:
-        self._select(None)
-        for index in range(len(self.entries)):
-            self._render_row(index)
-        self._fit_window(x, y)
-        self.window.deiconify()
-        self.window.lift()
-        self.open = True
-        self.window.focus_force()
-
-    def _fit_window(self, x: int, y: int) -> None:
-        self.window.update_idletasks()
-        width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
-        area = monitor_work_area(x, y, width, height)
-        x, y = clamp_position(x, y, width, height, area)
-        self.window.geometry(f"{width}x{height}+{x}+{y}")
-
-    def close(self) -> None:
-        if not self.open:
-            return
-        self.open = False
-        self.window.withdraw()
-        self._select(None)
-        self.on_close()
-
-    def _escape(self, event: tk.Event) -> str:
-        self.close()
-        return "break"
-
-    def _focus_out(self, event: tk.Event) -> None:
-        self.window.after_idle(self._close_if_unfocused)
-
-    def _close_if_unfocused(self) -> None:
-        if self.open:
-            focused = self.window.focus_get()
-            if focused is None or focused.winfo_toplevel() is not self.window:
-                self.close()
+from common.popup_menu import PopupMenu
+from common.win32 import (
+    DEFAULT_FONT_DIR,
+    RUN_KEY,
+    _MonitorInfo,
+    _MouseHookData,
+    _Rect,
+    apply_rounded_corners,
+    autostart_enabled_for,
+    clamp_position,
+    enable_dpi_awareness,
+    load_bundled_fonts,
+    monitor_work_area,
+    pythonw_command_for,
+    run_single_instance,
+    set_autostart_for,
+)
+
+__all__ = [
+    "BG",
+    "BOLD_FONT_FAMILY",
+    "DEFAULT_FONT_DIR",
+    "FONT_FAMILY",
+    "GRADIENT_STOPS",
+    "MUTED",
+    "RECOVERY_DELAYS",
+    "RUN_KEY",
+    "TEXT",
+    "TRACK",
+    "WINDOW_HEIGHT",
+    "WINDOW_WIDTH",
+    "YELLOW",
+    "BaseUsageWidget",
+    "PopupMenu",
+    "_MonitorInfo",
+    "_MouseHookData",
+    "_Rect",
+    "apply_rounded_corners",
+    "autostart_enabled_for",
+    "clamp_position",
+    "enable_dpi_awareness",
+    "gradient_color",
+    "load_bundled_fonts",
+    "monitor_work_area",
+    "pythonw_command_for",
+    "recovery_delay",
+    "reset_short",
+    "run_single_instance",
+    "set_autostart_for",
+    "usage_color",
+]
 
 
 class BaseUsageWidget:
@@ -931,6 +350,39 @@ class BaseUsageWidget:
             state="normal" if clickable else "disabled",
         )
 
+    def _render_metric_window(
+        self,
+        *,
+        value_label: tk.Label,
+        reset_label: tk.Label,
+        meter: tk.Canvas,
+        used_percent: int | None,
+        resets_at: int | None,
+        weekly: bool = False,
+        title_label: tk.Label | None = None,
+        fixed_fg: str | None = None,
+    ) -> None:
+        if used_percent is not None:
+            fg = fixed_fg if fixed_fg is not None else usage_color(used_percent)
+            if fixed_fg is None and title_label is not None:
+                title_label.configure(fg=fg)
+            value_label.configure(text=f"{used_percent}%", fg=fg)
+            if weekly:
+                reset_label.configure(text=reset_short(resets_at, weekly=True))
+            else:
+                reset_label.configure(text=reset_short(resets_at), fg=MUTED)
+            self.root.after_idle(lambda p=used_percent, m=meter: self._draw_segments(m, p))
+        else:
+            fg = fixed_fg if fixed_fg is not None else TEXT
+            if fixed_fg is None and title_label is not None:
+                title_label.configure(fg=fg)
+            value_label.configure(text="—%", fg=fg)
+            if weekly:
+                reset_label.configure(text=reset_short(None, weekly=True))
+            else:
+                reset_label.configure(text="—", fg=MUTED)
+            self._draw_segments(meter, None)
+
     def _build_header_shell(
         self,
         *,
@@ -1162,27 +614,7 @@ class BaseUsageWidget:
 
     def _apply_rounded_corners(self) -> None:
         """Ask Windows 11 DWM for iOS-like rounded top-level corners."""
-        if os.name != "nt":
-            return
-        try:
-            dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-            dwmapi.DwmSetWindowAttribute.argtypes = [
-                wintypes.HWND,
-                wintypes.DWORD,
-                ctypes.c_void_p,
-                wintypes.DWORD,
-            ]
-            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
-            preference = ctypes.c_int(2)  # DWMWCP_ROUND
-            hwnd = _resolve_top_level_hwnd(self.root.winfo_id())
-            dwmapi.DwmSetWindowAttribute(
-                hwnd,
-                33,
-                ctypes.byref(preference),
-                ctypes.sizeof(preference),
-            )
-        except (AttributeError, OSError):
-            pass
+        apply_rounded_corners(self.root.winfo_id())
 
     def _enable_click_through(self) -> None:
         """Keep the body transparent; intercept only right gestures starting on it."""

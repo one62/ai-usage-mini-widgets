@@ -4,7 +4,7 @@ Codex(ChatGPT)와 Gemini(Antigravity) 사용량을 바탕화면에 작게 띄워
 
 ## 폴더 구성
 
-- `common/`: 두 위젯이 함께 사용하는 설정 저장(`settings.py`), 창·후킹·우클릭 메뉴·공통 UI(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
+- `common/`: 두 위젯이 함께 사용하는 설정 저장(`settings.py`), 색상·시간 포맷(`formatting.py`), Win32 유틸(`win32.py`), 우클릭 메뉴(`popup_menu.py`), 공통 베이스 위젯(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
 - `codex-usage-widget/`: Codex 사용량 미니 위젯 ([상세 안내](codex-usage-widget/README.md))
 - `gemini-usage-widget/`: Gemini / Antigravity 사용량 미니 위젯 ([상세 안내](gemini-usage-widget/README.md))
 
@@ -20,6 +20,14 @@ Codex(ChatGPT)와 Gemini(Antigravity) 사용량을 바탕화면에 작게 띄워
 ```powershell
 python codex-usage-widget\widget.py
 python gemini-usage-widget\widget.py
+```
+
+## 테스트
+
+저장소 루트에서 전체 단위 테스트를 한 번에 실행할 수 있습니다.
+
+```powershell
+python -m unittest common/tests/test_common.py codex-usage-widget/tests/test_codex_widget.py gemini-usage-widget/tests/test_gemini_widget.py -v
 ```
 
 ## 라이선스
