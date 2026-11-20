@@ -53,6 +53,10 @@ class AuthRequiredError(UsageError):
     """Raised when Codex authentication is missing or expired."""
 
 
+class ResetAccountUnverifiedError(UsageError):
+    """The account that owns the pending reset cannot be verified."""
+
+
 @dataclass(frozen=True)
 class UsageWindow:
     used_percent: int
@@ -76,6 +80,8 @@ class UsageSnapshot:
     account: str | None = None
     reset_credit_id: str | None = None
     executable: str | None = None
+    account_id: str | None = None
+    reset_credit_details_limited: bool = False
 
 
 def _window(value: Any) -> UsageWindow | None:
@@ -147,27 +153,31 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
     reset_credit_count = None
     reset_credit_expires_at = None
     reset_credit_id = None
+    reset_credit_details_limited = False
     if isinstance(reset_credits, dict):
         count = reset_credits.get("availableCount")
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             reset_credit_count = count
             details = reset_credits.get("credits")
             if count > 0 and isinstance(details, list):
-                available = [credit for credit in details
-                             if isinstance(credit, dict) and credit.get("status") == "available"]
-                if len(available) == count and all(
-                    "expiresAt" in credit
+                available = [
+                    credit for credit in details
+                    if isinstance(credit, dict)
+                    and credit.get("status") == "available"
+                    and isinstance(credit.get("id"), str)
+                    and credit["id"].strip()
+                    and "expiresAt" in credit
                     and (credit["expiresAt"] is None or type(credit["expiresAt"]) is int)
-                    for credit in available
-                ):
+                ]
+                if 0 < len(available) <= count:
                     earliest = min(available, key=lambda credit: (
                         credit["expiresAt"] is None, credit["expiresAt"] or 0
                     ))
                     reset_credit_expires_at = earliest["expiresAt"]
-                    credit_id = earliest.get("id")
-                    if isinstance(credit_id, str) and credit_id.strip():
-                        reset_credit_id = credit_id
+                    reset_credit_id = earliest["id"]
+                    reset_credit_details_limited = len(available) < count
 
+    account_id = result.get("accountId")
     return UsageSnapshot(
         plan=str(rate_limits.get("planType") or result.get("planType") or "unknown"),
         primary=primary,
@@ -177,6 +187,8 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
         reset_credit_count=reset_credit_count,
         reset_credit_expires_at=reset_credit_expires_at,
         reset_credit_id=reset_credit_id,
+        account_id=account_id if isinstance(account_id, str) and account_id.strip() else None,
+        reset_credit_details_limited=reset_credit_details_limited,
     )
 
 
@@ -296,7 +308,8 @@ def find_codex_executables() -> list[str]:
 
 def _query_with_executable(executable: str, timeout: float,
                            reset_key: str | None = None,
-                           credit_id: str | None = None) -> UsageSnapshot | str:
+                           credit_id: str | None = None, *,
+                           expected_account_id: str | None = None) -> UsageSnapshot | str:
     """Read limits or redeem a reset through one concrete Codex executable."""
 
     deadline = time.monotonic() + timeout
@@ -335,14 +348,24 @@ def _query_with_executable(executable: str, timeout: float,
         _wait_for_id(reader, 1, deadline)
         _send(process, {"method": "initialized"})
         if reset_key is not None:
+            request_id = 2
+            if expected_account_id is not None:
+                _send(process, {"id": request_id, "method": "account/rateLimits/read"})
+                current = _wait_for_id(reader, request_id, deadline)
+                current_account_id = current.get("accountId")
+                if not isinstance(current_account_id, str) or not current_account_id.strip():
+                    raise ResetAccountUnverifiedError("현재 Codex에서 이전 요청의 계정을 확인할 수 없습니다.")
+                if current_account_id != expected_account_id:
+                    raise UsageError("원래 요청을 보낸 Codex 계정으로 로그인한 뒤 다시 시도해 주세요.")
+                request_id += 1
             if time.monotonic() >= deadline:
                 raise UsageError("리셋권 요청 시간이 초과되었습니다.")
             _send(process, {
-                "id": 2,
+                "id": request_id,
                 "method": "account/rateLimitResetCredit/consume",
                 "params": {"idempotencyKey": reset_key, "creditId": credit_id},
             })
-            result = _wait_for_id(reader, 2, deadline)
+            result = _wait_for_id(reader, request_id, deadline)
             outcome = result.get("outcome")
             if outcome not in ("reset", "alreadyRedeemed", "nothingToReset", "noCredit"):
                 raise UsageError("리셋권 사용 결과를 확인할 수 없습니다. 같은 요청으로 다시 확인해 주세요.")
@@ -468,21 +491,29 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
 
 
 def consume_reset_credit(idempotency_key: str, executable: str, credit_id: str,
-                         timeout: float = 18.0) -> str:
+                         timeout: float = 18.0, *, account_id: str | None = None) -> str:
     """Redeem once; callers retain the same key after an uncertain result."""
     if not all((idempotency_key, executable, credit_id)):
         raise ValueError("리셋권 요청 정보가 누락되었습니다.")
+    executables = find_codex_executables()
     target_key = os.path.normcase(os.path.abspath(executable))
     matched_executable = next(
-        (candidate for candidate in find_codex_executables()
+        (candidate for candidate in executables
          if os.path.normcase(os.path.abspath(candidate)) == target_key),
         None,
     )
     if matched_executable is None:
-        raise UsageError("리셋권을 조회한 Codex 실행 파일을 찾을 수 없습니다.")
-    # Never fall back or automatically retry a mutation after a transport error.
-    outcome = _query_with_executable(matched_executable, timeout, reset_key=idempotency_key,
-                                     credit_id=credit_id)
+        if not account_id:
+            raise ResetAccountUnverifiedError("이전 Codex 실행 파일과 요청의 계정 정보를 확인할 수 없습니다.")
+        if not executables:
+            raise UsageError("Codex 실행 파일을 찾을 수 없습니다. 설치 상태를 확인해 주세요.")
+        cached = _get_cached_executable()
+        matched_executable = cached if cached in executables else executables[0]
+    # Select the server before sending anything. Never retry a mutation after a transport error.
+    outcome = _query_with_executable(
+        matched_executable, timeout, reset_key=idempotency_key, credit_id=credit_id,
+        expected_account_id=account_id,
+    )
     if not isinstance(outcome, str):
         raise UsageError("리셋권 사용 결과 형식이 올바르지 않습니다.")
     return outcome

@@ -47,6 +47,7 @@ python widget.py
 
 - 설정: `%LOCALAPPDATA%\CodexUsageMini\settings.json` (투명도·마우스 진입 효과·위치·이동 잠금)
 - 미확정 리셋권 요청: `%LOCALAPPDATA%\CodexUsageMini\pending-reset.json` (재시작 후 같은 요청 재확인에 사용)
+- Codex 업데이트로 실행 파일이 바뀌면 같은 계정으로 로그인한 뒤 기존 요청을 재확인할 수 있습니다. 계정 정보가 없는 이전 기록은 원래 계정에서 처리 결과를 직접 확인한 뒤 메뉴 안내에 따라 보관할 수 있습니다.
 
 사용량 조회는 설치된 Codex 클라이언트의 인증을 사용하며, 별도 API 키 입력은 필요하지 않습니다.
 

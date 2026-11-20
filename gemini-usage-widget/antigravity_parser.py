@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -377,7 +378,7 @@ def _classify_model_family(tag: str) -> str | None:
     return None
 
 
-def _classify_bucket_cadence(bucket: dict[str, Any], resets_at: int | None) -> str | None:
+def _classify_bucket_cadence(bucket: dict[str, Any]) -> str | None:
     for key in ("window", "windowType", "window_type", "cadence", "period", "limitWindow", "limit_window"):
         raw = bucket.get(key)
         if isinstance(raw, str) and raw.strip():
@@ -401,13 +402,11 @@ def _classify_bucket_cadence(bucket: dict[str, Any], resets_at: int | None) -> s
     if any(token in bucket_tag for token in ("5h", "5-hour", "5_hour", "5 hour", "five-hour", "five hour", "short", "session", "5시간")):
         return "5h"
 
-    if resets_at is not None:
-        return "weekly" if (resets_at - int(time.time())) > 6 * 3600 else "5h"
     return None
 
 
-def _unwrap_summary_groups(summary_obj: dict[str, Any]) -> list[dict[str, Any]]:
-    queue_objs: list[dict[str, Any]] = [summary_obj]
+def _response_objects(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    queue_objs = [payload]
     visited = 0
     wrapper_keys = (
         "response",
@@ -418,13 +417,35 @@ def _unwrap_summary_groups(summary_obj: dict[str, Any]) -> list[dict[str, Any]]:
         "summary",
         "data",
         "result",
+        "userStatus",
     )
-    group_keys = ("groups", "quotaGroups", "quota_groups", "families", "modelGroups", "model_groups")
-    bucket_keys = ("buckets", "quotaBuckets", "quota_buckets")
-
     while queue_objs and visited < 12:
         current = queue_objs.pop(0)
         visited += 1
+        yield current
+        for key in wrapper_keys:
+            nested = current.get(key)
+            if isinstance(nested, dict):
+                queue_objs.append(nested)
+
+
+def _account_email(payload: dict[str, Any] | None) -> str | None:
+    if isinstance(payload, dict):
+        status = payload.get("userStatus")
+        if isinstance(status, dict):
+            payload = status
+        for obj in _response_objects(payload):
+            for key in ("email", "accountEmail"):
+                email = obj.get(key)
+                if isinstance(email, str) and email.strip():
+                    return email.strip()
+    return None
+
+
+def _unwrap_summary_groups(summary_obj: dict[str, Any]) -> list[dict[str, Any]]:
+    group_keys = ("groups", "quotaGroups", "quota_groups", "families", "modelGroups", "model_groups")
+    bucket_keys = ("buckets", "quotaBuckets", "quota_buckets")
+    for current in _response_objects(summary_obj):
         for key in group_keys:
             groups = current.get(key)
             if isinstance(groups, list):
@@ -433,10 +454,6 @@ def _unwrap_summary_groups(summary_obj: dict[str, Any]) -> list[dict[str, Any]]:
             buckets = current.get(key)
             if isinstance(buckets, list):
                 return [{"buckets": buckets}]
-        for wkey in wrapper_keys:
-            nested = current.get(wkey)
-            if isinstance(nested, dict):
-                queue_objs.append(nested)
     return []
 
 
@@ -454,6 +471,7 @@ def _parse_summary_groups(
 
     for group in groups:
         group_family = _classify_model_family(_collect_tag_text(group))
+        group_cadence = _classify_bucket_cadence(group)
         buckets = group.get("buckets")
         if not isinstance(buckets, list):
             buckets = group.get("quotaBuckets")
@@ -470,12 +488,14 @@ def _parse_summary_groups(
             family = group_family or _classify_model_family(_collect_tag_text(bucket))
             if family is None:
                 continue
+            cadence = _classify_bucket_cadence(bucket) or group_cadence
+            if cadence is None:
+                continue
 
             window = _window_from_quota_obj(bucket)
             if window is None:
                 continue
 
-            cadence = _classify_bucket_cadence(bucket, window.resets_at)
             is_weekly = cadence == "weekly"
 
             if family == "gemini":
@@ -500,7 +520,6 @@ def _parse_client_model_configs(
     claude_5h: LimitWindow | None = None
     claude_7d: LimitWindow | None = None
 
-    now = int(time.time())
     for entry in configs:
         if not isinstance(entry, dict):
             continue
@@ -549,15 +568,9 @@ def _parse_client_model_configs(
         short_win = _window_from_quota_obj(short_obj) if short_obj is not entry or has_inline_quota else None
         weekly_win = _window_from_quota_obj(weekly_obj) if weekly_obj else None
 
-        # A 5-hour rolling window cannot reset more than 6 hours in the future;
-        # if weeklyQuotaInfo is absent and reset is > 6h out, quotaInfo represents the weekly window.
-        if (
-            short_win is not None
-            and weekly_win is None
-            and short_win.resets_at is not None
-            and (short_win.resets_at - now) > 6 * 3600
-        ):
-            weekly_win = short_win
+        cadence = _classify_bucket_cadence(short_obj) or _classify_bucket_cadence(entry)
+        if short_win is not None and cadence == "weekly":
+            weekly_win = _pick_more_constrained(weekly_win, short_win)
             short_win = None
 
         if is_gemini:
@@ -618,15 +631,7 @@ def parse_user_quota(
         raise UsageError("Antigravity 응답에 사용량 한도 정보가 없습니다.")
 
     # 3. Extract Account Email
-    email = account_email
-    for candidate_email in (
-        user_status.get("email"),
-        user_status.get("accountEmail"),
-        (summary_result or {}).get("email") if isinstance(summary_result, dict) else None,
-    ):
-        if isinstance(candidate_email, str) and candidate_email.strip():
-            email = candidate_email.strip()
-            break
+    email = _account_email(user_status) or _account_email(summary_result) or account_email
 
     # 4. Extract Plan / Tier Name
     plan = "Antigravity"

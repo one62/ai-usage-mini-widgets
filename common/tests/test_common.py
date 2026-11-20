@@ -93,9 +93,10 @@ class CommonHelpersTests(unittest.TestCase):
             save_settings_to_path(expected, path)
             self.assertEqual(load_settings_from_path(path), expected)
 
-    def test_auth_required_enables_clickable_status_and_skips_fast_recovery_timer(self):
+    def test_auth_required_keeps_regular_refresh_without_fast_retry(self):
         widget = BaseUsageWidget.__new__(BaseUsageWidget)
         widget.root = mock.Mock()
+        widget.root.after.return_value = "regular-timer"
         widget.menu = mock.Mock()
         widget.reset_compact = mock.Mock()
         widget.connection_status_index = 1
@@ -108,7 +109,8 @@ class CommonHelpersTests(unittest.TestCase):
 
         widget.root.after_cancel.assert_called_once_with("timer-1")
         self.assertIsNone(widget.recovery_after_id)
-        widget.root.after.assert_not_called()
+        self.assertEqual(widget._scheduled_after_id, "regular-timer")
+        widget.root.after.assert_called_once_with(60_000, widget._scheduled_refresh)
         widget.menu.entryconfigure.assert_called_with(
             1,
             label="연결 상태: 로그인 필요",
@@ -156,6 +158,24 @@ class CommonHelpersTests(unittest.TestCase):
         widget._on_connection_status_click()
         widget._show_last_error.assert_called_once_with()
         widget._open_app.assert_not_called()
+
+    def test_recovery_refresh_defers_until_the_widget_is_free(self):
+        widget = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget._closing = False
+        widget.recovery_after_id = "original"
+        widget.root = mock.Mock()
+        widget.root.after.return_value = "deferred"
+        widget._can_start_refresh = mock.Mock(side_effect=[False, True])
+        widget.refresh = mock.Mock()
+
+        widget._recovery_refresh()
+        self.assertEqual(widget.recovery_after_id, "deferred")
+        widget.root.after.assert_called_once_with(1_000, widget._recovery_refresh)
+        widget.refresh.assert_not_called()
+
+        widget._recovery_refresh()
+        self.assertIsNone(widget.recovery_after_id)
+        widget.refresh.assert_called_once_with()
 
     def test_drain_results_cancels_watchdog_skips_stale_and_survives_render_error(self):
         widget = BaseUsageWidget.__new__(BaseUsageWidget)
@@ -238,19 +258,25 @@ class CommonHelpersTests(unittest.TestCase):
         widget.root.after.assert_not_called()
         self.assertFalse(widget._hovered)
 
-    def test_hover_transparency_does_not_brighten_when_base_transparency_over_80(self):
+    def test_native_opacity_leaves_click_through_style_in_place(self):
         widget = BaseUsageWidget.__new__(BaseUsageWidget)
         widget.root = mock.Mock()
+        widget._input_api = mock.Mock()
+        widget._input_hwnd = 123
         widget.hover_transparency_enabled = mock.Mock()
         widget.hover_transparency_enabled.get.return_value = True
+        widget._hovered = False
+
+        widget._apply_transparency(0)
         widget._hovered = True
-
-        widget._apply_transparency(30)
-        widget.root.attributes.assert_called_with("-alpha", 0.2)
-
-        widget._apply_transparency(90)
-        alpha = widget.root.attributes.call_args.args[1]
-        self.assertAlmostEqual(alpha, 0.1)
+        widget._apply_transparency(0)
+        widget._apply_transparency(96)
+        self.assertEqual(
+            widget._input_api.SetLayeredWindowAttributes.call_args_list,
+            [mock.call(123, 0, 255, 2), mock.call(123, 0, 51, 2), mock.call(123, 0, 10, 2)],
+        )
+        widget._input_api.SetWindowLongW.assert_not_called()
+        widget.root.attributes.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Requires Windows Tk")
     def test_popup_menu_release_outside_row_cancels_invoke(self):

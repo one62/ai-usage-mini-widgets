@@ -6,6 +6,7 @@ import tempfile
 import time
 import tkinter as tk
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -23,6 +24,7 @@ import codex_widget
 from codex_settings import PendingReset, load_pending_reset, save_pending_reset
 from codex_usage import (
     AuthRequiredError,
+    ResetAccountUnverifiedError,
     UsageError,
     UsageSnapshot,
     UsageWindow,
@@ -93,11 +95,37 @@ class ParseRateLimitsTests(unittest.TestCase):
             fake_settings = Path(temp) / "settings.json"
             with mock.patch.object(codex_settings, "settings_path", return_value=fake_settings):
                 self.assertIsNone(load_pending_reset())
-                pending = PendingReset(key="req-1", executable=r"C:\codex.exe", credit_id="cred-1")
+                pending = PendingReset("req-1", r"C:\codex.exe", "cred-1", "account-1")
                 save_pending_reset(pending)
                 self.assertEqual(load_pending_reset(), pending)
                 save_pending_reset(None)
                 self.assertIsNone(load_pending_reset())
+
+    def test_legacy_pending_reset_can_be_archived_without_losing_its_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pending-reset.json"
+            legacy = {"key": "req-1", "executable": r"C:\old\codex.exe", "credit_id": "cred-1"}
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            with mock.patch.object(codex_settings, "settings_path", return_value=path.with_name("settings.json")):
+                pending = load_pending_reset()
+                self.assertEqual(pending, PendingReset(**legacy))
+                with self.assertRaises(ValueError):
+                    codex_settings.archive_pending_reset(replace(pending, key="another-request"))
+                widget = UsageWidget.__new__(UsageWidget)
+                widget.pending_reset = pending
+                widget._closing = widget.resetting = False
+                widget.root = mock.Mock()
+                widget._update_reset_menu = mock.Mock()
+                widget.refresh = mock.Mock()
+                with mock.patch.object(codex_widget.messagebox, "askyesno", side_effect=[False, True]):
+                    widget._offer_archive_pending_reset("이전 요청의 계정 정보를 확인할 수 없습니다.")
+                    self.assertEqual(load_pending_reset(), pending)
+                    widget._offer_archive_pending_reset("이전 요청의 계정 정보를 확인할 수 없습니다.")
+                self.assertIsNone(load_pending_reset())
+                self.assertIsNone(widget.pending_reset)
+                widget.refresh.assert_called_once_with()
+                archived, = path.parent.glob("pending-reset-archived-*.json")
+                self.assertEqual(json.loads(archived.read_text(encoding="utf-8")), legacy)
 
     def test_auth_error_propagates_as_auth_required_and_is_non_retryable(self):
         stream = [json.dumps({"id": 2, "error": {"message": "401 Unauthorized"}}) + "\n"]
@@ -139,6 +167,7 @@ class ParseRateLimitsTests(unittest.TestCase):
         self.assertEqual(snapshot.reset_credit_count, 2)
         self.assertEqual(snapshot.reset_credit_id, "sooner")
         self.assertEqual(snapshot.reset_credit_expires_at, 1000)
+        self.assertFalse(snapshot.reset_credit_details_limited)
 
         nan_snapshot = parse_rate_limits(
             {
@@ -154,7 +183,35 @@ class ParseRateLimitsTests(unittest.TestCase):
         )
         self.assertIsNone(nan_snapshot.credit_balance)
         self.assertEqual(nan_snapshot.reset_credit_count, 2)
-        self.assertIsNone(nan_snapshot.reset_credit_id)
+        self.assertEqual(nan_snapshot.reset_credit_id, "only-one")
+        self.assertTrue(nan_snapshot.reset_credit_details_limited)
+
+    def test_capped_credit_list_enables_a_confirmed_selection(self):
+        widget = UsageWidget.__new__(UsageWidget)
+        snapshot = parse_rate_limits({
+            "accountId": "account-1",
+            "rateLimits": {"primary": {"usedPercent": 10}},
+            "rateLimitResetCredits": {
+                "availableCount": 2,
+                "credits": [{"id": "only-one", "status": "available", "expiresAt": None}],
+            },
+        })
+        widget.snapshot = replace(snapshot, executable=r"C:\codex.exe")
+        widget.resetting = widget.refreshing = widget.connection_failed = widget.reset_state_unreadable = False
+        widget.pending_reset = None
+        widget.root = mock.Mock()
+        widget.menu = mock.Mock()
+        widget.reset_count_index = 1
+        widget.reset_use_index = 2
+        widget._ensure_topmost = mock.Mock()
+
+        widget._update_reset_menu()
+        widget.menu.entryconfigure.assert_called_with(2, label="리셋권 사용하기", state="normal")
+        with mock.patch.object(codex_widget.messagebox, "askyesno", return_value=False) as ask:
+            widget._use_reset_credit()
+        self.assertIn("만료일 없음", ask.call_args.args[1])
+        self.assertIn("조회된 상세 목록", ask.call_args.args[1])
+        self.assertEqual(snapshot.account_id, "account-1")
 
     def test_token_limit_error_is_not_misclassified_as_auth_and_auth_message_preserved(self):
         reader = _LineReader([json.dumps({"id": 2, "error": {"message": "max token limit exceeded"}}) + "\n"])
@@ -236,6 +293,51 @@ class ParseRateLimitsTests(unittest.TestCase):
         self.assertIsNone(widget.pending_reset)
         widget.refresh.assert_called_once_with()
         widget.root.after.assert_not_called()
+
+    def test_replacement_executable_checks_account_before_reusing_reset_key(self):
+        previous = r"C:\old\codex.exe"
+        current = r"C:\new\codex.exe"
+        for account in (None, "other", "original"):
+            with self.subTest(account=account):
+                process = mock.Mock()
+                process.poll.return_value = 0
+                with (
+                    mock.patch.object(codex_usage, "find_codex_executables", return_value=[current]),
+                    mock.patch.object(codex_usage.subprocess, "Popen", return_value=process) as launch,
+                    mock.patch.object(codex_usage, "_LineReader"),
+                    mock.patch.object(codex_usage, "_wait_for_id", side_effect=[
+                        {}, {"accountId": account}, {"outcome": "alreadyRedeemed"},
+                    ]),
+                    mock.patch.object(codex_usage, "_send") as send,
+                ):
+                    if account == "original":
+                        result = consume_reset_credit("req-1", previous, "cred-1", account_id="original")
+                        self.assertEqual(result, "alreadyRedeemed")
+                    elif account is None:
+                        with self.assertRaises(ResetAccountUnverifiedError):
+                            consume_reset_credit("req-1", previous, "cred-1", account_id="original")
+                    else:
+                        with self.assertRaises(UsageError):
+                            consume_reset_credit("req-1", previous, "cred-1", account_id="original")
+                launch.assert_called_once()
+                self.assertEqual(launch.call_args.args[0][0], current)
+                requests = [call.args[1] for call in send.call_args_list]
+                self.assertEqual(requests[2]["method"], "account/rateLimits/read")
+                if account == "original":
+                    self.assertEqual(requests[3], {
+                        "id": 3, "method": "account/rateLimitResetCredit/consume",
+                        "params": {"idempotencyKey": "req-1", "creditId": "cred-1"},
+                    })
+                else:
+                    self.assertEqual(len(requests), 3)
+
+        with (
+            mock.patch.object(codex_usage, "find_codex_executables", return_value=[current]),
+            mock.patch.object(codex_usage, "_query_with_executable") as query,
+        ):
+            with self.assertRaises(ResetAccountUnverifiedError):
+                consume_reset_credit("req-1", previous, "cred-1")
+        query.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Requires Windows Tk font metrics")
     def test_fixed_titles_zero_border_labels_and_login_status_action(self):

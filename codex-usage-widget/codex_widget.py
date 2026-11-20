@@ -21,6 +21,7 @@ for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
 
 from codex_settings import (
     PendingReset,
+    archive_pending_reset,
     load_pending_reset,
     load_settings,
     save_pending_reset,
@@ -28,6 +29,8 @@ from codex_settings import (
 )
 from codex_usage import (
     AuthRequiredError,
+    ResetAccountUnverifiedError,
+    UsageError,
     UsageSnapshot,
     consume_reset_credit,
     find_codex_executables,
@@ -133,17 +136,7 @@ class UsageWidget(BaseUsageWidget):
 
     def _update_reset_menu(self) -> None:
         count = self.snapshot.reset_credit_count if self.snapshot else None
-        expires_at = self.snapshot.reset_credit_expires_at if self.snapshot else None
-        expiry = ""
-        if count:
-            try:
-                expiry = (
-                    f"~{datetime.fromtimestamp(expires_at):%m.%d.}"
-                    if expires_at is not None
-                    else "만료일 조회 불가"
-                )
-            except (OverflowError, OSError, ValueError):
-                expiry = "만료일 조회 불가"
+        expiry = self._reset_expiry_label(self.snapshot) if count else ""
         self.menu.entryconfigure(
             self.reset_count_index,
             label=f"사용량 리셋권: {count}개" if count is not None else "사용량 리셋권: 조회 불가",
@@ -175,12 +168,27 @@ class UsageWidget(BaseUsageWidget):
             state="normal" if enabled else "disabled",
         )
 
+    @staticmethod
+    def _reset_expiry_label(snapshot: UsageSnapshot) -> str:
+        expires_at = snapshot.reset_credit_expires_at
+        if expires_at is None and snapshot.reset_credit_id is not None:
+            return "만료일 없음"
+        if expires_at is not None:
+            try:
+                return f"~{datetime.fromtimestamp(expires_at):%m.%d.}"
+            except (OverflowError, OSError, ValueError):
+                pass
+        return "만료일 조회 불가"
+
     def _use_reset_credit(self) -> None:
         if self.resetting or self.refreshing or self.reset_state_unreadable:
             return
         request = self.pending_reset
         snapshot = self.snapshot
-        if request is None:
+        retry = request is not None
+        if retry:
+            prompt = "이전 리셋권 사용 요청의 결과를 같은 요청 키로 다시 확인합니다.\n계속하시겠습니까?"
+        else:
             if (
                 self.connection_failed
                 or snapshot is None
@@ -188,19 +196,25 @@ class UsageWidget(BaseUsageWidget):
                 or not snapshot.executable
             ):
                 return
-            request = PendingReset(str(uuid.uuid4()), snapshot.executable, snapshot.reset_credit_id)
-        retry = self.pending_reset is not None
-        prompt = (
-            "이전 리셋권 사용 요청의 결과를 같은 요청 키로 다시 확인합니다.\n계속하시겠습니까?"
-            if retry
-            else "사용량 리셋권 1개를 사용하시겠습니까? 만료가 있는 권리부터 사용합니다.\n\n"
-            "초기화 대상 기간은 서버가 결정하며, 주간 사용량만 지정할 수는 없습니다."
-        )
+            request = PendingReset(
+                str(uuid.uuid4()), snapshot.executable, snapshot.reset_credit_id, snapshot.account_id
+            )
+            selection = (
+                "조회된 상세 목록에서 만료일이 가장 빠른 권리를 선택했습니다."
+                if snapshot.reset_credit_details_limited
+                else "만료가 있는 권리부터 사용합니다."
+            )
+            prompt = (
+                f"사용량 리셋권 1개를 사용하시겠습니까? ({self._reset_expiry_label(snapshot)})\n"
+                f"{selection}\n\n초기화 대상 기간은 서버가 결정하며, 주간 사용량만 지정할 수는 없습니다."
+            )
         if not messagebox.askyesno("사용량 리셋권", prompt, parent=self.root):
             self._ensure_topmost()
             return
         self._ensure_topmost()
         # Tk modal dialogs keep timers running, including scheduled refreshes.
+        if self._closing:
+            return
         if self.resetting or self.refreshing:
             messagebox.showinfo("사용량 리셋권", "조회가 끝난 뒤 다시 선택해 주세요.", parent=self.root)
             self._ensure_topmost()
@@ -231,9 +245,12 @@ class UsageWidget(BaseUsageWidget):
 
     def _reset_worker(self, request: PendingReset) -> None:
         try:
-            self.reset_results.put(
-                ("ok", consume_reset_credit(request.key, request.executable, request.credit_id))
+            outcome = consume_reset_credit(
+                request.key, request.executable, request.credit_id, account_id=request.account_id
             )
+            self.reset_results.put(("ok", outcome))
+        except UsageError as exc:
+            self.reset_results.put(("error", exc))
         except Exception:
             self.reset_results.put(("error", ""))
 
@@ -271,13 +288,38 @@ class UsageWidget(BaseUsageWidget):
             self._ensure_topmost()
         else:
             self._update_reset_menu()
-            messagebox.showwarning(
-                "사용량 리셋권",
-                "리셋권 사용 결과를 확인하지 못했습니다.\n\n"
-                "‘리셋권 사용 결과 재확인’에서 같은 리셋권과 요청 키로 확인할 수 있습니다.",
-                parent=self.root,
-            )
+            if isinstance(payload, ResetAccountUnverifiedError):
+                self._offer_archive_pending_reset(str(payload))
+            else:
+                detail = f"\n\n{payload}" if isinstance(payload, UsageError) else ""
+                messagebox.showwarning(
+                    "사용량 리셋권",
+                    "리셋권 사용 결과를 확인하지 못했습니다.\n\n"
+                    "‘리셋권 사용 결과 재확인’에서 같은 리셋권과 요청 키로 확인할 수 있습니다."
+                    f"{detail}",
+                    parent=self.root,
+                )
             self._ensure_topmost()
+
+    def _offer_archive_pending_reset(self, detail: str) -> None:
+        request = self.pending_reset
+        if request is None or not messagebox.askyesno(
+            "리셋권 요청 기록 보관",
+            f"{detail}\n\n원래 Codex 계정에서 처리 결과를 직접 확인한 경우, "
+            "이전 기록을 보관하고 새 요청을 허용하시겠습니까?",
+            parent=self.root,
+        ):
+            return
+        if self._closing or self.resetting or self.pending_reset != request:
+            return
+        try:
+            archive_pending_reset(request)
+        except (OSError, ValueError, RecursionError):
+            messagebox.showwarning("사용량 리셋권", "요청 기록을 보관하지 못했습니다.", parent=self.root)
+        else:
+            self.pending_reset = None
+            self._update_reset_menu()
+            self.refresh()
 
     def _update_time_labels(self) -> None:
         snapshot = self.snapshot

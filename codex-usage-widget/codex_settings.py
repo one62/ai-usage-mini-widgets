@@ -6,6 +6,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 _WIDGET_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _WIDGET_DIR.parent
@@ -27,6 +28,7 @@ class PendingReset:
     key: str
     executable: str
     credit_id: str
+    account_id: str | None = None
 
 
 def settings_path() -> Path:
@@ -55,7 +57,10 @@ def load_pending_reset() -> PendingReset | None:
     key, executable, credit_id = (data.get(name) for name in ("key", "executable", "credit_id"))
     if not all(isinstance(value, str) and value.strip() for value in (key, executable, credit_id)):
         raise ValueError("Invalid pending reset")
-    return PendingReset(key, executable, credit_id)
+    account_id = data.get("account_id")
+    if account_id is not None and (not isinstance(account_id, str) or not account_id.strip()):
+        raise ValueError("Invalid pending reset account ID")
+    return PendingReset(key, executable, credit_id, account_id)
 
 
 def save_pending_reset(request: PendingReset | None) -> None:
@@ -69,5 +74,14 @@ def save_pending_reset(request: PendingReset | None) -> None:
                 "key": request.key,
                 "executable": request.executable,
                 "credit_id": request.credit_id,
+                "account_id": request.account_id,
             },
         )
+
+
+def archive_pending_reset(request: PendingReset) -> None:
+    """Preserve an unresolved record when the user confirms it in Codex directly."""
+    if load_pending_reset() != request:
+        raise ValueError("Pending reset changed")
+    path = settings_path().with_name("pending-reset.json")
+    path.rename(path.with_name(f"pending-reset-archived-{uuid4().hex}.json"))

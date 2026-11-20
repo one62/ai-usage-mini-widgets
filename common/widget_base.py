@@ -295,7 +295,9 @@ class BaseUsageWidget:
         self._on_refresh_state_changed()
         self.failure_count += 1
         self._render_connection_issue()
-        if not auth_required and getattr(self, "recovery_after_id", None) is None:
+        if auth_required:
+            self._scheduled_after_id = self.root.after(60_000, self._scheduled_refresh)
+        elif getattr(self, "recovery_after_id", None) is None:
             delay = recovery_delay(self.failure_count)
             self.recovery_after_id = self.root.after(delay * 1000, self._recovery_refresh)
 
@@ -624,6 +626,10 @@ class BaseUsageWidget:
             "GetSystemMetrics": ([ctypes.c_int], ctypes.c_int),
             "GetWindowLongW": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_long),
             "SetWindowLongW": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_long], ctypes.c_long),
+            "SetLayeredWindowAttributes": (
+                [wintypes.HWND, wintypes.DWORD, ctypes.c_ubyte, wintypes.DWORD],
+                wintypes.BOOL,
+            ),
             "GetWindowRect": ([ctypes.c_void_p, ctypes.POINTER(_Rect)], ctypes.c_int),
             "IsWindowVisible": ([ctypes.c_void_p], ctypes.c_int),
             "WindowFromPoint": ([wintypes.POINT], wintypes.HWND),
@@ -688,6 +694,7 @@ class BaseUsageWidget:
             previous = api.SetWindowLongW(self._input_hwnd, -20, style | 0x80000 | 0x20)
             if not previous and ctypes.get_last_error():
                 raise ctypes.WinError(ctypes.get_last_error())
+            self._set_window_alpha(float(self.root.attributes("-alpha")))
         except OSError:
             self._stop_mouse_hook()
             raise
@@ -884,7 +891,16 @@ class BaseUsageWidget:
         alpha = 1.0 - max(0, min(100, value)) / 100
         if self._hovered and self.hover_transparency_enabled.get():
             alpha = min(alpha, 0.2)
-        self.root.attributes("-alpha", alpha)
+        self._set_window_alpha(alpha)
+
+    def _set_window_alpha(self, alpha: float) -> None:
+        hwnd = getattr(self, "_input_hwnd", None)
+        if not hwnd:
+            self.root.attributes("-alpha", alpha)
+            return
+        # Tk's first opacity change can overwrite the native click-through style.
+        if not self._input_api.SetLayeredWindowAttributes(hwnd, 0, round(255 * alpha), 2):  # LWA_ALPHA
+            raise ctypes.WinError(ctypes.get_last_error())
 
     def _toggle_hover_transparency(self) -> None:
         self._apply_transparency(self.transparency.get())
@@ -955,6 +971,11 @@ class BaseUsageWidget:
 
     def _recovery_refresh(self) -> None:
         self.recovery_after_id = None
+        if self._closing:
+            return
+        if not self._can_start_refresh():
+            self.recovery_after_id = self.root.after(1_000, self._recovery_refresh)
+            return
         self.refresh()
 
     def _update_clock(self) -> None:

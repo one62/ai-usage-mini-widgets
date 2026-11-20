@@ -20,7 +20,7 @@ from antigravity_parser import (
     AuthRequiredError,
     UsageError,
     UsageSnapshot,
-    _has_weekly_limits,
+    _account_email,
     parse_user_quota,
 )
 
@@ -48,6 +48,11 @@ _PARTIAL_CACHE_TTL_SECONDS = 300.0
 _HTTPS_SSL_CONTEXT: ssl.SSLContext | None = None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _get_https_ssl_context() -> ssl.SSLContext:
     global _HTTPS_SSL_CONTEXT
     if _HTTPS_SSL_CONTEXT is None:
@@ -71,7 +76,7 @@ def _call_language_server_rpc(
         else (_METADATA_BODY, _EMPTY_BODY)
     )
 
-    handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
+    handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({}), _NoRedirectHandler()]
     if scheme == "https":
         handlers.append(urllib.request.HTTPSHandler(context=_get_https_ssl_context()))
     opener = urllib.request.build_opener(*handlers)
@@ -171,15 +176,26 @@ def _fetch_endpoint_payloads(
     return status_payload, summary_payload
 
 
+def _account_key(payload: dict[str, Any] | None) -> str | None:
+    email = _account_email(payload)
+    return email.casefold() if email else None
+
+
 def _build_snapshot_from_payloads(
     status_payload: dict[str, Any] | None,
     summary_payload: dict[str, Any] | None,
     fallback_status_payload: dict[str, Any] | None = None,
 ) -> UsageSnapshot:
-    effective_status = status_payload if status_payload is not None else fallback_status_payload
+    summary_account = _account_key(summary_payload)
+    if status_payload is not None:
+        status_account = _account_key(status_payload)
+        if status_account and summary_account and status_account != summary_account:
+            summary_payload = None
+    elif summary_account and summary_account == _account_key(fallback_status_payload):
+        status_payload = fallback_status_payload
     return parse_user_quota(
-        effective_status or summary_payload or {},
-        summary_result=summary_payload if effective_status is not None else None,
+        status_payload or summary_payload or {},
+        summary_result=summary_payload if status_payload is not None else None,
     )
 
 
@@ -198,11 +214,11 @@ def _fetch_from_endpoint(
         csrf_token=csrf_token,
         timeout=timeout,
     )
-    if status_payload is None and status_endpoint is not None:
+    if status_payload is None and status_endpoint is not None and _account_key(summary_payload):
         remaining = deadline - time.monotonic()
         if remaining > 0.2:
             try:
-                status_payload = _call_language_server_rpc(
+                fallback_status_payload = _call_language_server_rpc(
                     scheme=str(status_endpoint["scheme"]),
                     port=int(status_endpoint["port"]),
                     path=_GET_USER_STATUS_PATH,
@@ -220,6 +236,33 @@ def _fetch_from_endpoint(
     )
 
 
+def _quota_coverage(snapshot: UsageSnapshot) -> tuple[int, int, bool, bool]:
+    gemini_weekly = snapshot.seven_day is not None
+    gemini_short = snapshot.five_hour is not None
+    return (
+        int(gemini_weekly) + int(snapshot.claude_gpt_seven_day is not None),
+        int(gemini_short) + int(snapshot.claude_gpt_five_hour is not None),
+        gemini_weekly,
+        gemini_short,
+    )
+
+
+def _cache_snapshot(
+    snapshot: UsageSnapshot,
+    endpoint: dict[str, Any],
+    status_endpoint: dict[str, Any] | None = None,
+) -> UsageSnapshot:
+    with _CACHE_LOCK:
+        _ENDPOINT_CACHE.clear()
+        _ENDPOINT_CACHE.update(
+            endpoint,
+            coverage=_quota_coverage(snapshot),
+            cached_at=time.monotonic(),
+            status_endpoint=status_endpoint,
+        )
+    return snapshot
+
+
 def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     """Fetch current Gemini & Claude/GPT quota from the local Antigravity Language Server."""
     deadline = time.monotonic() + timeout
@@ -227,9 +270,9 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
         cached_endpoint = dict(_ENDPOINT_CACHE) if _ENDPOINT_CACHE else None
 
     if cached_endpoint:
-        cache_has_weekly = cached_endpoint.get("has_weekly") is True
+        cached_coverage = cached_endpoint["coverage"]
         cache_age = time.monotonic() - float(cached_endpoint.get("cached_at", 0.0))
-        if cache_has_weekly or cache_age < _PARTIAL_CACHE_TTL_SECONDS:
+        if cached_coverage[:2] == (2, 2) or cache_age < _PARTIAL_CACHE_TTL_SECONDS:
             try:
                 snapshot = _fetch_from_endpoint(
                     scheme=str(cached_endpoint["scheme"]),
@@ -238,7 +281,7 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
                     timeout=min(timeout, 3.5),
                     status_endpoint=cached_endpoint.get("status_endpoint"),
                 )
-                if not cache_has_weekly or _has_weekly_limits(snapshot):
+                if _quota_coverage(snapshot) >= cached_coverage:
                     return snapshot
             except urllib.error.HTTPError as exc:
                 exc.close()
@@ -256,9 +299,8 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     per_attempt_timeout = max(1.5, min(timeout / 4.0, 3.5))
     saw_auth_error = False
     last_error: Exception | None = None
-    fallback_status_payload: dict[str, Any] | None = None
-    fallback_status_endpoint: dict[str, Any] | None = None
-    best_partial: tuple[UsageSnapshot, dict[str, Any]] | None = None
+    status_by_account: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    candidates: list[tuple[UsageSnapshot, dict[str, Any], dict[str, Any] | None]] = []
     tried: set[tuple[str, int, str]] = set()
 
     _TCP_TABLE_LOCAL.snapshot = _get_all_listening_ports_win32()
@@ -285,36 +327,18 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
                             csrf_token=proc.csrf_token,
                             timeout=min(per_attempt_timeout, remaining),
                         )
-                        if status_payload is not None and fallback_status_payload is None:
-                            fallback_status_payload = status_payload
-                            fallback_status_endpoint = {
-                                "scheme": scheme,
-                                "port": port,
-                                "csrf_token": proc.csrf_token,
-                            }
-
-                        snapshot = _build_snapshot_from_payloads(
-                            status_payload=status_payload,
-                            summary_payload=summary_payload,
-                            fallback_status_payload=fallback_status_payload,
-                        )
-                        cache_entry = {
-                            "pid": proc.pid,
+                        endpoint = {
                             "scheme": scheme,
                             "port": port,
                             "csrf_token": proc.csrf_token,
-                            "has_weekly": _has_weekly_limits(snapshot),
-                            "cached_at": time.monotonic(),
-                            "status_endpoint": fallback_status_endpoint if status_payload is None else None,
                         }
-                        if _has_weekly_limits(snapshot):
-                            with _CACHE_LOCK:
-                                _ENDPOINT_CACHE.clear()
-                                _ENDPOINT_CACHE.update(cache_entry)
-                            return snapshot
-
-                        if best_partial is None:
-                            best_partial = (snapshot, cache_entry)
+                        account = _account_key(status_payload)
+                        if account and status_payload is not None:
+                            status_by_account.setdefault(account, (status_payload, endpoint))
+                        snapshot = _build_snapshot_from_payloads(status_payload, summary_payload)
+                        if status_payload is not None and _quota_coverage(snapshot)[:2] == (2, 2):
+                            return _cache_snapshot(snapshot, endpoint)
+                        candidates.append((snapshot, endpoint, summary_payload if status_payload is None else None))
                         # Stop trying http on the same port once https succeeded, and check next port/process.
                         break
                     except urllib.error.HTTPError as exc:
@@ -329,12 +353,22 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     finally:
         _TCP_TABLE_LOCAL.snapshot = None
 
-    if best_partial is not None:
-        snapshot, cache_entry = best_partial
-        with _CACHE_LOCK:
-            _ENDPOINT_CACHE.clear()
-            _ENDPOINT_CACHE.update(cache_entry)
-        return snapshot
+    best: tuple[UsageSnapshot, dict[str, Any], dict[str, Any] | None] | None = None
+    for snapshot, endpoint, summary_payload in candidates:
+        status_endpoint = None
+        account = _account_key(summary_payload)
+        if account and account in status_by_account:
+            status_payload, matching_endpoint = status_by_account[account]
+            try:
+                snapshot = _build_snapshot_from_payloads(None, summary_payload, status_payload)
+            except (UsageError, ValueError, ArithmeticError):
+                pass
+            else:
+                status_endpoint = matching_endpoint
+        if best is None or _quota_coverage(snapshot) > _quota_coverage(best[0]):
+            best = (snapshot, endpoint, status_endpoint)
+    if best is not None:
+        return _cache_snapshot(*best)
 
     if saw_auth_error:
         raise AuthRequiredError(

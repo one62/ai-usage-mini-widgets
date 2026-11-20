@@ -280,6 +280,25 @@ class ParseUserQuotaTests(unittest.TestCase):
         self.assertEqual(_parse_reset_time(1763629200000), 1763629200)
         self.assertEqual(_parse_reset_time({"seconds": "1763629200", "nanos": 0}), 1763629200)
 
+    def test_summary_cadence_does_not_change_as_the_reset_approaches(self):
+        now = 2_000_000_000
+        unlabeled = {"remainingFraction": 0.5, "resetTime": now + 7 * 3600}
+        summary = {"groups": [{"id": "gemini", "buckets": [
+            {"window": "5h", "remainingFraction": 0.9},
+            unlabeled,
+        ]}]}
+        for current_time in (now, now + 2 * 3600):
+            with mock.patch("antigravity_parser.time.time", return_value=current_time):
+                snapshot = parse_user_quota(summary)
+            self.assertEqual(snapshot.five_hour.used_percent, 10)
+            self.assertIsNone(snapshot.seven_day)
+
+        unlabeled["window"] = "weekly"
+        with mock.patch("antigravity_parser.time.time", return_value=now + 2 * 3600):
+            snapshot = parse_user_quota(summary)
+        self.assertEqual(snapshot.five_hour.used_percent, 10)
+        self.assertEqual(snapshot.seven_day.used_percent, 50)
+
     def test_discovery_skips_powershell_and_netstat_when_win32_succeeds_empty(self):
         with mock.patch.object(antigravity_discovery, "_discover_daemon_candidates", return_value=[]):
             with mock.patch.object(antigravity_discovery, "_discover_processes_win32_status", return_value=(True, [])):
@@ -372,7 +391,7 @@ class ParseUserQuotaTests(unittest.TestCase):
                     )
                 return _FakeResponse({"response": {"groups": []}})
 
-        with mock.patch("antigravity_client.urllib.request.build_opener", return_value=_FakeOpener()):
+        with mock.patch("antigravity_client.urllib.request.build_opener", return_value=_FakeOpener()) as build:
             _call_language_server_rpc(
                 "https", 50001, "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary", "tok", 2.0
             )
@@ -387,6 +406,12 @@ class ParseUserQuotaTests(unittest.TestCase):
         self.assertIn(b'"metadata"', captured[1][1])
         self.assertIn(b'"metadata"', captured[2][1])
         self.assertEqual(captured[3][1], b"{}")
+        redirect_handler, = (
+            handler for handler in build.call_args.args
+            if isinstance(handler, antigravity_client.urllib.request.HTTPRedirectHandler)
+        )
+        request = antigravity_client.urllib.request.Request(captured[0][0], data=b"{}")
+        self.assertIsNone(redirect_handler.redirect_request(request, None, 302, "Found", {}, captured[1][0]))
 
     def test_query_usage_continues_past_5h_only_process_and_merges_weekly_summary(self):
         with antigravity_client._CACHE_LOCK:
@@ -413,7 +438,7 @@ class ParseUserQuotaTests(unittest.TestCase):
                 priority=0,
             )
 
-            credits_value = {"amount": "320"}
+            status = {"amount": "320", "email": "merged@example.com"}
 
             def fake_rpc(scheme: str, port: int, path: str, csrf_token: str, timeout: float):
                 if port == 51001:
@@ -421,10 +446,10 @@ class ParseUserQuotaTests(unittest.TestCase):
                         raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
                     return {
                         "userStatus": {
-                            "email": "merged@example.com",
+                            "email": status["email"],
                             "userTier": {
                                 "name": "Google AI Pro",
-                                "availableCredits": [{"creditAmount": credits_value["amount"]}],
+                                "availableCredits": [{"creditAmount": status["amount"]}],
                             },
                             "cascadeModelConfigData": {
                                 "clientModelConfigs": [
@@ -451,6 +476,7 @@ class ParseUserQuotaTests(unittest.TestCase):
                         raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
                     return {
                         "response": {
+                            "email": "MERGED@example.com",
                             "groups": [
                                 {
                                     "bucketId": "gemini-models",
@@ -494,7 +520,7 @@ class ParseUserQuotaTests(unittest.TestCase):
             with mock.patch.object(
                 antigravity_client,
                 "_discover_language_server_processes",
-                return_value=[proc_ide, proc_hub],
+                return_value=[proc_hub, proc_ide],
             ) as discover_mock:
                 with mock.patch.object(
                     antigravity_client,
@@ -503,14 +529,19 @@ class ParseUserQuotaTests(unittest.TestCase):
                 ):
                     with mock.patch.object(antigravity_client, "_call_language_server_rpc", side_effect=fake_rpc):
                         snapshot = query_usage(timeout=5.0)
-                        credits_value["amount"] = "280"
+                        status["amount"] = "280"
                         second_snapshot = query_usage(timeout=5.0)
+                        status["email"] = "other@example.com"
+                        switched_snapshot = query_usage(timeout=5.0)
 
             self.assertEqual(discover_mock.call_count, 1)
             self.assertEqual(snapshot.account_email, "merged@example.com")
             self.assertEqual(snapshot.plan, "Google AI Pro")
             self.assertEqual(snapshot.credit_balance, 320)
             self.assertEqual(second_snapshot.credit_balance, 280)
+            self.assertEqual(switched_snapshot.account_email, "MERGED@example.com")
+            self.assertIsNone(switched_snapshot.credit_balance)
+            self.assertEqual(switched_snapshot.seven_day.used_percent, 30)
             self.assertEqual(snapshot.five_hour.used_percent, 15)
             self.assertEqual(snapshot.seven_day.used_percent, 30)
             self.assertIsNotNone(snapshot.seven_day.resets_at)
@@ -520,6 +551,46 @@ class ParseUserQuotaTests(unittest.TestCase):
         finally:
             with antigravity_client._CACHE_LOCK:
                 antigravity_client._ENDPOINT_CACHE.clear()
+
+    def test_summary_without_an_account_does_not_inherit_separate_status(self):
+        summary = {"groups": [{"id": "gemini", "buckets": [
+            {"window": "weekly", "remainingFraction": 0.8},
+        ]}]}
+        status = {"userStatus": {"email": "separate@example.com", "creditBalance": 100}}
+        snapshot = antigravity_client._build_snapshot_from_payloads(None, summary, status)
+
+        self.assertEqual(snapshot.seven_day.used_percent, 20)
+        self.assertIsNone(snapshot.account_email)
+        self.assertIsNone(snapshot.credit_balance)
+
+    def test_claude_weekly_alone_does_not_prevent_gemini_rediscovery(self):
+        proc1 = _LanguageServerProcess(1, "first", "", "first", (50001,))
+        proc2 = _LanguageServerProcess(2, "second", "", "second", (50002,))
+        short = {"id": "gemini", "buckets": [{"window": "5h", "remainingFraction": 0.8}]}
+        claude = {"id": "claude", "buckets": [{"window": "weekly", "remainingFraction": 0.9}]}
+        gemini = {"id": "gemini", "buckets": [{"window": "weekly", "remainingFraction": 0.7}]}
+
+        def payloads(scheme, port, csrf_token, timeout):
+            groups = [short, claude] if port == 50001 else [short, claude, gemini]
+            return None, {"groups": groups}
+
+        with (
+            mock.patch.object(antigravity_client, "_ENDPOINT_CACHE", {}),
+            mock.patch.object(antigravity_client, "_discover_language_server_processes", return_value=[proc1]) as discover,
+            mock.patch.object(antigravity_client, "_get_all_listening_ports_win32", return_value=(True, {})),
+            mock.patch.object(antigravity_client, "_fetch_endpoint_payloads", side_effect=payloads),
+            mock.patch.object(antigravity_client.time, "monotonic", return_value=1_000.0) as clock,
+        ):
+            self.assertIsNone(query_usage().seven_day)
+            self.assertIsNone(query_usage().seven_day)
+            discover.assert_called_once_with()
+            clock.return_value += antigravity_client._PARTIAL_CACHE_TTL_SECONDS
+            discover.return_value = [proc1, proc2]
+            snapshot = query_usage()
+
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(snapshot.seven_day.used_percent, 30)
+        self.assertEqual(snapshot.claude_gpt_seven_day.used_percent, 10)
 
     def test_query_usage_reuses_partial_cache_and_raises_auth_required_on_401(self):
         with antigravity_client._CACHE_LOCK:
