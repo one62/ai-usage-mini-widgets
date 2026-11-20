@@ -40,8 +40,56 @@ RECOVERY_DELAYS = (15, 30, 60, 120, 300)
 DEFAULT_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 
 
+_USER32_CACHE: ctypes.WinDLL | None = None
+
+
+def _get_user32() -> ctypes.WinDLL:
+    global _USER32_CACHE
+    if _USER32_CACHE is None:
+        api = ctypes.WinDLL("user32", use_last_error=True)
+        api.MonitorFromRect.argtypes = [ctypes.POINTER(_Rect), ctypes.c_ulong]
+        api.MonitorFromRect.restype = ctypes.c_void_p
+        api.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MonitorInfo)]
+        api.GetMonitorInfoW.restype = ctypes.c_int
+        api.GetSystemMetrics.argtypes = [ctypes.c_int]
+        api.GetSystemMetrics.restype = ctypes.c_int
+        api.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        api.GetAncestor.restype = ctypes.c_void_p
+        api.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+        api.MessageBoxW.restype = ctypes.c_int
+        _USER32_CACHE = api
+    return _USER32_CACHE
+
+
+def _resolve_top_level_hwnd(hwnd: int) -> int:
+    if os.name != "nt" or not hwnd:
+        return hwnd
+    try:
+        root_hwnd = _get_user32().GetAncestor(hwnd, 2)  # GA_ROOT
+        return int(root_hwnd) if root_hwnd else hwnd
+    except (AttributeError, OSError):
+        return hwnd
+
+
+def _show_native_info(title: str, message: str) -> None:
+    if os.name == "nt":
+        try:
+            _get_user32().MessageBoxW(None, message, title, 0x40)  # MB_OK | MB_ICONINFORMATION
+            return
+        except (AttributeError, OSError):
+            pass
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        messagebox.showinfo(title, message, parent=root)
+    finally:
+        root.destroy()
+
+
 def load_bundled_fonts(font_directory: Path | None = None) -> None:
     """Register bundled Nexon Football Gothic fonts privately for this process."""
+    if os.name != "nt":
+        return
     target_dir = font_directory or DEFAULT_FONT_DIR
     gdi32 = ctypes.WinDLL("gdi32")
     gdi32.AddFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
@@ -108,11 +156,7 @@ def monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int
     if os.name != "nt":
         return (0, 0, max(width, x + width), max(height, y + height))
     try:
-        user32 = ctypes.windll.user32
-        user32.MonitorFromRect.argtypes = [ctypes.POINTER(_Rect), ctypes.c_ulong]
-        user32.MonitorFromRect.restype = ctypes.c_void_p
-        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MonitorInfo)]
-        user32.GetMonitorInfoW.restype = ctypes.c_int
+        user32 = _get_user32()
         rect = _Rect(x, y, x + width, y + height)
         monitor = user32.MonitorFromRect(ctypes.byref(rect), 2)  # nearest monitor
         info = _MonitorInfo()
@@ -120,9 +164,9 @@ def monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int
         if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
             work = info.rcWork
             return (work.left, work.top, work.right, work.bottom)
+        return (0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
     except (AttributeError, OSError):
-        pass
-    return (0, 0, ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1))
+        return (0, 0, max(width, x + width), max(height, y + height))
 
 
 def reset_short(timestamp: int | None, *, weekly: bool = False) -> str:
@@ -131,12 +175,13 @@ def reset_short(timestamp: int | None, *, weekly: bool = False) -> str:
     seconds = max(0, timestamp - int(time.time()))
     if seconds == 0:
         return "now"
-    # Round up to minutes so a positive remainder never appears as zero.
-    total_minutes = (seconds + 59) // 60
+    total_minutes = seconds // 60
     days, remainder = divmod(total_minutes, 1440)
     hours, minutes = divmod(remainder, 60)
     if weekly:
         return f"{days}d {hours}h"
+    if total_minutes == 0:
+        return "<1m"
     if total_minutes == 1440:
         return "24h 0m"
     if days:
@@ -218,7 +263,7 @@ def enable_dpi_awareness() -> None:
         shcore = ctypes.WinDLL("shcore", use_last_error=True)
         shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
         shcore.SetProcessDpiAwareness.restype = ctypes.c_long
-        if shcore.SetProcessDpiAwareness(2) == 0:
+        if shcore.SetProcessDpiAwareness(2) in (0, -2147024891):  # S_OK or E_ACCESSDENIED
             return
     raise RuntimeError("Could not enable per-monitor DPI awareness")
 
@@ -247,7 +292,7 @@ def run_single_instance(
 
     if error == error_already_exists:
         kernel.CloseHandle(mutex)
-        messagebox.showinfo(app_title, "위젯이 이미 실행 중입니다.")
+        _show_native_info(app_title, "위젯이 이미 실행 중입니다.")
         return
 
     try:
@@ -363,11 +408,11 @@ class PopupMenu:
             )
         )
         if kind != "info":
-            for target in (row, indicator, text_widget):
+            for target in (row, indicator, text_widget, right_widget):
                 if target is not None:
                     target.bind("<Enter>", lambda event, i=index: self._select(i))
-                    target.bind("<Leave>", lambda event: self._select(None))
-                    target.bind("<ButtonRelease-1>", lambda event, i=index: self._invoke(i))
+                    target.bind("<Leave>", lambda event, i=index: self._leave_row(i, event))
+                    target.bind("<ButtonRelease-1>", lambda event, i=index: self._release_row(i, event))
         # Information labels have no mouse, keyboard, or command bindings.
         self._render_row(index)
 
@@ -449,6 +494,7 @@ class PopupMenu:
         )
         for target in (row, caption, text_widget, value_widget, scale):
             target.bind("<Enter>", lambda event, i=index: self._select(i))
+            target.bind("<Leave>", lambda event, i=index: self._leave_row(i, event))
         scale.bind("<ButtonPress-1>", lambda event, i=index: self._select(i), add="+")
         scale.bind("<FocusIn>", lambda event, i=index: self._select(i))
         scale.bind("<Up>", lambda event: self._navigate(-1))
@@ -525,6 +571,24 @@ class PopupMenu:
                 indicator.create_rectangle(2, 2, 15, 15, outline=foreground)
                 if entry["variable"].get():
                     indicator.create_line(4, 8, 7, 11, 13, 5, fill=foreground, width=2)
+
+    @staticmethod
+    def _pointer_inside_widget(widget: tk.Widget, x_root: int, y_root: int) -> bool:
+        left = widget.winfo_rootx()
+        top = widget.winfo_rooty()
+        width = widget.winfo_width() if widget.winfo_width() > 1 else widget.winfo_reqwidth()
+        height = widget.winfo_height() if widget.winfo_height() > 1 else widget.winfo_reqheight()
+        return left <= x_root < left + width and top <= y_root < top + height
+
+    def _leave_row(self, index: int, event: tk.Event) -> None:
+        if self.selected == index and not self._pointer_inside_widget(
+            self.entries[index]["widget"], event.x_root, event.y_root
+        ):
+            self._select(None)
+
+    def _release_row(self, index: int, event: tk.Event) -> None:
+        if self._pointer_inside_widget(self.entries[index]["widget"], event.x_root, event.y_root):
+            self._invoke(index)
 
     def _select(self, index: int | None) -> None:
         previous = self.selected
@@ -614,6 +678,7 @@ class BaseUsageWidget:
         self._settings_ready = False
         self._closing = False
         self.root = tk.Tk()
+        self.root.withdraw()
         self.root.title(self.APP_TITLE)
         self.root.configure(bg=BG)
         self.root.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
@@ -635,14 +700,21 @@ class BaseUsageWidget:
         self.fetch_generation = 0
         self.failure_count = 0
         self.recovery_after_id: str | None = None
+        self._scheduled_after_id: str | None = None
+        self._watchdog_after_id: str | None = None
         self.connection_failed = False
         self.last_error = ""
         self.auth_required = False
-        self.always_on_top = tk.BooleanVar(value=True)
-        self.autostart = tk.BooleanVar(value=autostart_enabled_for(self.RUN_VALUE, self._script_path))
+        self.always_on_top = tk.BooleanVar(master=self.root, value=True)
+        self.autostart = tk.BooleanVar(
+            master=self.root,
+            value=autostart_enabled_for(self.RUN_VALUE, self._script_path),
+        )
 
     def _finalize_init(self) -> None:
         self._restore_position()
+        self.root.deiconify()
+        self.root.update_idletasks()
         self._apply_rounded_corners()
         self._bind_actions()
         self._enable_click_through()
@@ -652,7 +724,6 @@ class BaseUsageWidget:
         self.root.after(500, self._drain_results)
         self._start_extra_timers()
         self.root.after(60_000, self._update_clock)
-        self.root.after(60_000, self._scheduled_refresh)
 
     # Subclass extension points (with safe defaults for partial test instances)
     def _load_widget_settings(self):
@@ -682,9 +753,21 @@ class BaseUsageWidget:
     def _render(self, snapshot) -> None:
         raise NotImplementedError
 
+    def _cancel_timer(self, attr_name: str) -> None:
+        timer_id = getattr(self, attr_name, None)
+        if timer_id is not None:
+            setattr(self, attr_name, None)
+            try:
+                self.root.after_cancel(timer_id)
+            except tk.TclError:
+                pass
+
     def refresh(self) -> None:
         if not self._can_start_refresh():
             return
+        self._cancel_timer("_scheduled_after_id")
+        self._cancel_timer("recovery_after_id")
+        self._cancel_timer("_watchdog_after_id")
         self.refreshing = True
         self.fetch_generation += 1
         generation = self.fetch_generation
@@ -694,7 +777,7 @@ class BaseUsageWidget:
         if self.snapshot is None:
             self.reset_compact.configure(text="…", fg=MUTED)
         threading.Thread(target=self._fetch_worker, args=(generation,), daemon=True).start()
-        self.root.after(50_000, lambda: self._fetch_watchdog(generation))
+        self._watchdog_after_id = self.root.after(50_000, lambda: self._fetch_watchdog(generation))
 
     def _fetch_worker(self, generation: int) -> None:
         last_error: Exception | None = None
@@ -714,6 +797,7 @@ class BaseUsageWidget:
         )
 
     def _fetch_watchdog(self, generation: int) -> None:
+        self._watchdog_after_id = None
         if not self.refreshing or generation != self.fetch_generation:
             return
         self.fetch_generation += 1  # Ignore a late result from the stuck worker.
@@ -722,45 +806,58 @@ class BaseUsageWidget:
         self._handle_connection_error("사용량 조회가 50초를 초과했습니다.")
 
     def _drain_results(self) -> None:
+        if getattr(self, "_closing", False):
+            return
         try:
-            generation, kind, payload = self.results.get_nowait()
-        except queue.Empty:
-            self.root.after(500, self._drain_results)
-            return
-        if generation != self.fetch_generation:
-            self.root.after(500, self._drain_results)
-            return
-        self.refreshing = False
-        self.menu.entryconfigure(0, state="normal")
-        if kind == "ok" and payload is not None:
-            if self.recovery_after_id is not None:
-                self.root.after_cancel(self.recovery_after_id)
-                self.recovery_after_id = None
-            self.connection_failed = False
-            self.last_error = ""
-            self.auth_required = False
-            self.failure_count = 0
-            self.snapshot = payload
-            self._update_connection_status()
-            self._render(payload)
-        else:
-            auth_required = isinstance(payload, Exception) and self._is_non_retryable_fetch_error(payload)
-            message = str(payload) if payload else "알 수 없는 오류"
-            self._handle_connection_error(message, auth_required=auth_required)
-        self.root.after(500, self._drain_results)
+            while True:
+                try:
+                    generation, kind, payload = self.results.get_nowait()
+                except queue.Empty:
+                    break
+                if generation != self.fetch_generation:
+                    continue
+                self._cancel_timer("_watchdog_after_id")
+                self.refreshing = False
+                self.menu.entryconfigure(0, state="normal")
+                if kind == "ok" and payload is not None:
+                    self._cancel_timer("recovery_after_id")
+                    self._cancel_timer("_scheduled_after_id")
+                    self.connection_failed = False
+                    self.last_error = ""
+                    self.auth_required = False
+                    self.failure_count = 0
+                    self.snapshot = payload
+                    self._update_connection_status()
+                    self._on_refresh_state_changed()
+                    self._render(payload)
+                    self._scheduled_after_id = self.root.after(60_000, self._scheduled_refresh)
+                else:
+                    auth_required = isinstance(payload, Exception) and self._is_non_retryable_fetch_error(payload)
+                    message = str(payload) if payload else "알 수 없는 오류"
+                    self._handle_connection_error(message, auth_required=auth_required)
+        except Exception as exc:
+            self.refreshing = False
+            try:
+                self.menu.entryconfigure(0, state="normal")
+            except tk.TclError:
+                pass
+            self._handle_connection_error(str(exc) or "렌더링 오류")
+        finally:
+            if not getattr(self, "_closing", False):
+                self.root.after(500, self._drain_results)
 
     def _handle_connection_error(self, message: str = "", *, auth_required: bool = False) -> None:
         self.connection_failed = True
         self.last_error = message or "connection failed"
         self.auth_required = auth_required
-        if auth_required and self.recovery_after_id is not None:
-            self.root.after_cancel(self.recovery_after_id)
-            self.recovery_after_id = None
+        self._cancel_timer("_scheduled_after_id")
+        if auth_required:
+            self._cancel_timer("recovery_after_id")
         self._update_connection_status()
         self._on_refresh_state_changed()
         self.failure_count += 1
         self._render_connection_issue()
-        if not auth_required and self.recovery_after_id is None:
+        if not auth_required and getattr(self, "recovery_after_id", None) is None:
             delay = recovery_delay(self.failure_count)
             self.recovery_after_id = self.root.after(delay * 1000, self._recovery_refresh)
 
@@ -776,16 +873,32 @@ class BaseUsageWidget:
         else:
             self.reset_compact.configure(text="offline", fg=MUTED)
 
+    def _on_connection_status_click(self) -> None:
+        if getattr(self, "auth_required", False):
+            self._open_app()
+        elif getattr(self, "connection_failed", False) or getattr(self, "last_error", ""):
+            self._show_last_error()
+
+    def _show_last_error(self) -> None:
+        detail = getattr(self, "last_error", "") or "알 수 없는 연결 오류입니다."
+        messagebox.showinfo(
+            self.APP_TITLE,
+            f"최근 연결 오류:\n\n{detail}",
+            parent=self.root,
+        )
+        self._ensure_topmost()
+
     def _update_connection_status(self) -> None:
         """Display cached query state without starting a connection check."""
-        auth_clickable = False
+        clickable = False
         if self.refreshing:
             status = "조회 중"
         elif getattr(self, "auth_required", False):
             status = "로그인 필요"
-            auth_clickable = True
+            clickable = True
         elif getattr(self, "connection_failed", False) or getattr(self, "last_error", ""):
             status = "재연결 중"
+            clickable = True
         elif self.snapshot is not None:
             status = "정상"
         else:
@@ -793,7 +906,7 @@ class BaseUsageWidget:
         self.menu.entryconfigure(
             self.connection_status_index,
             label=f"연결 상태: {status}",
-            state="normal" if auth_clickable else "disabled",
+            state="normal" if clickable else "disabled",
         )
 
     def _build_header_shell(
@@ -966,11 +1079,11 @@ class BaseUsageWidget:
             self._position_top_right()
             return
         self.root.update_idletasks()
-        width = self.root.winfo_width()
+        width = max(WINDOW_WIDTH, self.root.winfo_reqwidth(), self.root.winfo_width())
         x, y = self.settings.x, self.settings.y
         area = monitor_work_area(x, y, width, WINDOW_HEIGHT)
         x, y = clamp_position(x, y, width, WINDOW_HEIGHT, area)
-        self.root.geometry(f"+{x}+{y}")
+        self.root.geometry(f"{width}x{WINDOW_HEIGHT}+{x}+{y}")
 
     def _position_changed(self, event: tk.Event) -> None:
         if event.widget is self.root:
@@ -1000,21 +1113,25 @@ class BaseUsageWidget:
         if self._closing:
             return
         self._closing = True
-        if self._settings_after_id is not None:
-            self.root.after_cancel(self._settings_after_id)
+        self._cancel_timer("_settings_after_id")
+        self._cancel_timer("_scheduled_after_id")
+        self._cancel_timer("recovery_after_id")
+        self._cancel_timer("_watchdog_after_id")
         self._save_preferences()
         self.root.destroy()
 
     def _position_top_right(self) -> None:
         self.root.update_idletasks()
         screen_width = self.root.winfo_screenwidth()
-        width = self.root.winfo_width()
+        width = max(WINDOW_WIDTH, self.root.winfo_reqwidth(), self.root.winfo_width())
         area = monitor_work_area(screen_width - 1, 0, width, WINDOW_HEIGHT)
         x, y = clamp_position(area[2] - width - 18, area[1] + 18, width, WINDOW_HEIGHT, area)
         self.root.geometry(f"{width}x{WINDOW_HEIGHT}+{x}+{y}")
 
     def _apply_rounded_corners(self) -> None:
         """Ask Windows 11 DWM for iOS-like rounded top-level corners."""
+        if os.name != "nt":
+            return
         try:
             dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
             dwmapi.DwmSetWindowAttribute.argtypes = [
@@ -1025,8 +1142,9 @@ class BaseUsageWidget:
             ]
             dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
             preference = ctypes.c_int(2)  # DWMWCP_ROUND
+            hwnd = _resolve_top_level_hwnd(self.root.winfo_id())
             dwmapi.DwmSetWindowAttribute(
-                self.root.winfo_id(),
+                hwnd,
                 33,
                 ctypes.byref(preference),
                 ctypes.sizeof(preference),
@@ -1046,6 +1164,8 @@ class BaseUsageWidget:
         )
         signatures = {
             "GetAncestor": ([ctypes.c_void_p, ctypes.c_uint], ctypes.c_void_p),
+            "GetAsyncKeyState": ([ctypes.c_int], ctypes.c_short),
+            "GetSystemMetrics": ([ctypes.c_int], ctypes.c_int),
             "GetWindowLongW": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_long),
             "SetWindowLongW": ([ctypes.c_void_p, ctypes.c_int, ctypes.c_long], ctypes.c_long),
             "GetWindowRect": ([ctypes.c_void_p, ctypes.POINTER(_Rect)], ctypes.c_int),
@@ -1170,6 +1290,10 @@ class BaseUsageWidget:
                     self._dismiss_menu_outside(x, y)
                 return self._input_api.CallNextHookEx(None, code, message, data)
             if message == 0x204:  # WM_RBUTTONDOWN
+                if self._right_captured:
+                    # A previous WM_RBUTTONUP was lost (e.g., released over an elevated window).
+                    self._right_captured = False
+                    self._mouse_events.put(("up", x, y))
                 rect = _Rect()
                 if (
                     self._input_api.IsWindowVisible(self._input_hwnd)
@@ -1186,7 +1310,12 @@ class BaseUsageWidget:
                     self._mouse_events.put(("up", x, y))
                     return 1
                 if message == 0x200:
-                    self._mouse_events.put(("move", x, y))
+                    key_state = self._input_api.GetAsyncKeyState(0x02)  # VK_RBUTTON
+                    if isinstance(key_state, int) and not (key_state & 0x8000):
+                        self._right_captured = False
+                        self._mouse_events.put(("up", x, y))
+                    else:
+                        self._mouse_events.put(("move", x, y))
         return self._input_api.CallNextHookEx(None, code, message, data)
 
     def _dismiss_menu_outside(self, x: int, y: int) -> None:
@@ -1268,7 +1397,7 @@ class BaseUsageWidget:
     def _apply_transparency(self, value: int) -> None:
         alpha = 1.0 - max(0, min(100, value)) / 100
         if self._hovered and self.hover_transparency_enabled.get():
-            alpha = 0.2
+            alpha = min(alpha, 0.2)
         self.root.attributes("-alpha", alpha)
 
     def _toggle_hover_transparency(self) -> None:
@@ -1288,6 +1417,8 @@ class BaseUsageWidget:
         if hovered != self._hovered:
             self._hovered = hovered
             self._apply_transparency(self.transparency.get())
+            if hovered and not self._menu_open and self.always_on_top.get():
+                self.root.attributes("-topmost", True)
         self.root.after(50, self._update_hover)
 
     def _toggle_autostart(self) -> None:
@@ -1298,7 +1429,9 @@ class BaseUsageWidget:
             messagebox.showerror(
                 self.APP_TITLE,
                 f"Windows 시작 시 자동 실행 설정을 변경하지 못했습니다.\n{exc}",
+                parent=self.root,
             )
+            self._ensure_topmost()
 
     def _draw_segments(self, canvas: tk.Canvas, used_percent: int | None) -> None:
         canvas.delete("all")
@@ -1324,8 +1457,13 @@ class BaseUsageWidget:
         self.root.after(60_000, self._update_clock)
 
     def _scheduled_refresh(self) -> None:
+        self._scheduled_after_id = None
+        if getattr(self, "_closing", False):
+            return
+        if not self._can_start_refresh():
+            self._scheduled_after_id = self.root.after(60_000, self._scheduled_refresh)
+            return
         self.refresh()
-        self.root.after(60_000, self._scheduled_refresh)
 
     def run(self) -> None:
         self.root.mainloop()

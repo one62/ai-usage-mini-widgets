@@ -63,7 +63,11 @@ class UsageWidget(BaseUsageWidget):
 
         self.menu = PopupMenu(self.root, self._menu_closed, reserve_indicator_space=True)
         self.menu.add_command(label="지금 새로고침", command=self.refresh)
-        self.menu.add_command(label="연결 상태: 확인 전", command=self._open_app, state="disabled")
+        self.menu.add_command(
+            label="연결 상태: 확인 전",
+            command=self._on_connection_status_click,
+            state="disabled",
+        )
         self.connection_status_index = self.menu.index("end")
         self.menu.add_separator()
         self.menu.add_info(label="계정: —")

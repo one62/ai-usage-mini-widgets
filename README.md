@@ -4,7 +4,7 @@ Codex(ChatGPT)와 Gemini(Antigravity) 사용량을 바탕화면에 작게 띄워
 
 ## 폴더 구성
 
-- `common/`: 두 위젯이 함께 사용하는 설정 저장(`settings.py`), 창·후킹·트레이/메뉴·공통 UI(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
+- `common/`: 두 위젯이 함께 사용하는 설정 저장(`settings.py`), 창·후킹·우클릭 메뉴·공통 UI(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
 - `codex-usage-widget/`: Codex 사용량 미니 위젯 ([상세 안내](codex-usage-widget/README.md))
 - `gemini-usage-widget/`: Gemini / Antigravity 사용량 미니 위젯 ([상세 안내](gemini-usage-widget/README.md))
 

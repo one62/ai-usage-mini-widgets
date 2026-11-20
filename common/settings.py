@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 
@@ -19,7 +20,8 @@ class WidgetSettings:
 
 
 def app_settings_path(app_dir_name: str) -> Path:
-    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / app_dir_name / "settings.json"
+    base = os.environ.get("LOCALAPPDATA") or Path.home()
+    return Path(base) / app_dir_name / "settings.json"
 
 
 def _integer_in_range(value: object, minimum: int, maximum: int) -> bool:
@@ -62,23 +64,8 @@ def load_settings_from_path(path: Path) -> WidgetSettings:
 
 def save_settings_to_path(settings: WidgetSettings, path: Path) -> None:
     """Atomically replace the settings file, propagating filesystem failures."""
-    validated = validate_settings(
-        {
-            "transparency": settings.transparency,
-            "x": settings.x,
-            "y": settings.y,
-            "movement_locked": settings.movement_locked,
-            "hover_transparency_enabled": settings.hover_transparency_enabled,
-        }
-    )
-    data = {
-        "transparency": validated.transparency,
-        "x": validated.x,
-        "y": validated.y,
-        "movement_locked": validated.movement_locked,
-        "hover_transparency_enabled": validated.hover_transparency_enabled,
-    }
-    write_json_atomic(path, data)
+    validated = validate_settings(asdict(settings))
+    write_json_atomic(path, asdict(validated))
 
 
 def write_json_atomic(destination: Path, data: dict) -> None:
@@ -92,7 +79,7 @@ def write_json_atomic(destination: Path, data: dict) -> None:
             encoding="utf-8",
             newline="\n",
             dir=destination.parent,
-            prefix=".settings-",
+            prefix=f".{destination.stem}-",
             suffix=".tmp",
             delete=False,
         ) as target:
@@ -101,8 +88,16 @@ def write_json_atomic(destination: Path, data: dict) -> None:
             target.write("\n")
             target.flush()
             os.fsync(target.fileno())
-        # Windows requires the temporary file to be closed before replacement.
-        os.replace(temporary, destination)
+        # Windows requires the temporary file to be closed before replacement,
+        # and antivirus/indexers can briefly hold a transient lock.
+        for attempt in range(3):
+            try:
+                os.replace(temporary, destination)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.02)
         temporary = None
     finally:
         if temporary is not None:

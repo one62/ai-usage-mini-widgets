@@ -17,6 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from common.settings import (
     WidgetSettings,
+    app_settings_path,
     load_settings_from_path,
     save_settings_to_path,
     validate_settings,
@@ -56,7 +57,13 @@ class CommonHelpersTests(unittest.TestCase):
             self.assertEqual(reset_short(1_000_000 + 86_400), "24h 0m")
             self.assertEqual(reset_short(1_000_000 + 90_000), "1d 1h")
             self.assertEqual(reset_short(1_000_000 + 3_660), "1h 1m")
-            self.assertEqual(reset_short(1_000_000 + 61), "2m")
+            self.assertEqual(reset_short(1_000_000 + 61), "1m")
+            self.assertEqual(reset_short(1_000_000 + 30), "<1m")
+
+    def test_app_settings_path_falls_back_when_localappdata_empty(self):
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": ""}, clear=False):
+            path = app_settings_path("CodexUsageMini")
+            self.assertEqual(path, Path.home() / "CodexUsageMini" / "settings.json")
 
     def test_settings_validation_and_atomic_persistence(self):
         validated = validate_settings(
@@ -120,6 +127,107 @@ class CommonHelpersTests(unittest.TestCase):
             label="연결 상태: 정상",
             state="disabled",
         )
+
+    def test_connection_error_cancels_scheduled_refresh_and_enables_error_dialog(self):
+        widget = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget.root = mock.Mock()
+        widget.root.after.return_value = "recovery-1"
+        widget.menu = mock.Mock()
+        widget.reset_compact = mock.Mock()
+        widget.connection_status_index = 1
+        widget.refreshing = False
+        widget.snapshot = None
+        widget.failure_count = 0
+        widget.recovery_after_id = None
+        widget._scheduled_after_id = "sched-1"
+        widget._open_app = mock.Mock()
+        widget._show_last_error = mock.Mock()
+
+        widget._handle_connection_error("server offline", auth_required=False)
+
+        widget.root.after_cancel.assert_called_once_with("sched-1")
+        self.assertIsNone(widget._scheduled_after_id)
+        self.assertEqual(widget.recovery_after_id, "recovery-1")
+        widget.menu.entryconfigure.assert_called_with(
+            1,
+            label="연결 상태: 재연결 중",
+            state="normal",
+        )
+        widget._on_connection_status_click()
+        widget._show_last_error.assert_called_once_with()
+        widget._open_app.assert_not_called()
+
+    def test_drain_results_cancels_watchdog_skips_stale_and_survives_render_error(self):
+        widget = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget.root = mock.Mock()
+        widget.root.after.return_value = "next-timer"
+        widget.menu = mock.Mock()
+        widget.reset_compact = mock.Mock()
+        widget.connection_status_index = 1
+        widget.results = queue.Queue()
+        widget.fetch_generation = 2
+        widget.refreshing = True
+        widget.snapshot = None
+        widget.failure_count = 0
+        widget.recovery_after_id = None
+        widget._scheduled_after_id = None
+        widget._watchdog_after_id = "wd-1"
+        widget._closing = False
+        widget._render = mock.Mock(side_effect=RuntimeError("bad render"))
+
+        widget.results.put((1, "ok", "stale"))
+        widget.results.put((2, "ok", "fresh"))
+        widget._drain_results()
+
+        widget.root.after_cancel.assert_any_call("wd-1")
+        self.assertFalse(widget.refreshing)
+        self.assertTrue(widget.connection_failed)
+        self.assertIn("bad render", widget.last_error)
+        self.assertTrue(
+            any(call.args == (500, widget._drain_results) for call in widget.root.after.call_args_list)
+        )
+
+    def test_hover_transparency_does_not_brighten_when_base_transparency_over_80(self):
+        widget = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget.root = mock.Mock()
+        widget.hover_transparency_enabled = mock.Mock()
+        widget.hover_transparency_enabled.get.return_value = True
+        widget._hovered = True
+
+        widget._apply_transparency(30)
+        widget.root.attributes.assert_called_with("-alpha", 0.2)
+
+        widget._apply_transparency(90)
+        alpha = widget.root.attributes.call_args.args[1]
+        self.assertAlmostEqual(alpha, 0.1)
+
+    @unittest.skipUnless(os.name == "nt", "Requires Windows Tk")
+    def test_popup_menu_release_outside_row_cancels_invoke(self):
+        enable_dpi_awareness()
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            action = mock.Mock()
+            menu = PopupMenu(root, lambda: None)
+            menu.add_command(label="종료", command=action)
+            menu.show(100, 100)
+            menu.window.update_idletasks()
+            row = menu.entries[0]["widget"]
+            outside_event = mock.Mock(
+                x_root=row.winfo_rootx() + row.winfo_width() + 50,
+                y_root=row.winfo_rooty() + row.winfo_height() + 50,
+            )
+            menu._release_row(0, outside_event)
+            action.assert_not_called()
+
+            inside_event = mock.Mock(
+                x_root=row.winfo_rootx() + 2,
+                y_root=row.winfo_rooty() + 2,
+            )
+            menu._release_row(0, inside_event)
+            action.assert_called_once_with()
+        finally:
+            root.destroy()
 
     @unittest.skipUnless(os.name == "nt", "Requires Windows Tk")
     def test_clicking_login_required_status_invokes_open_app(self):
@@ -193,6 +301,7 @@ class MouseGestureTests(unittest.TestCase):
             return 1
 
         widget._input_api.GetWindowRect.side_effect = rectangle
+        widget._input_api.GetAsyncKeyState.return_value = -32768  # VK_RBUTTON held
 
         def send(message, x=110, y=110, code=0):
             data = _MouseHookData()
@@ -215,6 +324,21 @@ class MouseGestureTests(unittest.TestCase):
         for message in (0x201, 0x204, 0x207, 0x20B):
             self.assertEqual(send(message), 42)
         self.assertEqual(widget._dismiss_menu_outside.call_count, 4)
+
+    def test_hook_recovers_if_right_button_released_over_elevated_window(self):
+        widget = self.widget
+        widget._input_api = mock.Mock()
+        widget._input_api.CallNextHookEx.return_value = 42
+        widget._input_api.GetAsyncKeyState.return_value = 0  # VK_RBUTTON not pressed
+        widget._input_hwnd = 1
+        widget._right_captured = True
+        widget._menu_open = False
+
+        data = _MouseHookData()
+        data.pt.x, data.pt.y = 300, 300
+        self.assertEqual(widget._mouse_hook(0, 0x200, ctypes.addressof(data)), 42)
+        self.assertFalse(widget._right_captured)
+        self.assertEqual(widget._mouse_events.get_nowait(), ("up", 300, 300))
 
     def test_destroy_unhooks_only_for_root(self):
         self.widget._hook_thread = mock.Mock()
