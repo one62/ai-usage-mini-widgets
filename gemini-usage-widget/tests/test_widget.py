@@ -28,12 +28,16 @@ from common.widget_base import (
     usage_color,
 )
 from gemini_usage import (
+    AuthRequiredError,
     LimitWindow,
     UsageError,
     UsageSnapshot,
     _LanguageServerProcess,
     _call_language_server_rpc,
+    _candidate_ports_for_process,
     _discover_daemon_candidates,
+    _discover_language_server_processes,
+    _fetch_endpoint_payloads,
     _parse_reset_time,
     find_antigravity_executables,
     parse_command_line_ports,
@@ -268,9 +272,74 @@ class ParseUserQuotaTests(unittest.TestCase):
 
     def test_parse_reset_time_supports_iso_nanos_epoch_strings_ms_and_proto_timestamp(self):
         self.assertIsInstance(_parse_reset_time("2026-11-20T09:00:00.123456789Z"), int)
+        self.assertIsInstance(_parse_reset_time("2026-11-20T09:00:00.1Z"), int)
+        self.assertIsInstance(_parse_reset_time("2026-11-20T09:00:00.1234Z"), int)
+        self.assertIsNone(_parse_reset_time("0001-01-01T00:00:00Z"))
         self.assertEqual(_parse_reset_time("1763629200"), 1763629200)
         self.assertEqual(_parse_reset_time(1763629200000), 1763629200)
         self.assertEqual(_parse_reset_time({"seconds": "1763629200", "nanos": 0}), 1763629200)
+
+    def test_discovery_skips_powershell_and_netstat_when_win32_succeeds_empty(self):
+        with mock.patch("gemini_usage._discover_daemon_candidates", return_value=[]):
+            with mock.patch("gemini_usage._discover_processes_win32_status", return_value=(True, [])):
+                with mock.patch("gemini_usage._discover_processes_powershell") as ps_mock:
+                    self.assertEqual(_discover_language_server_processes(), [])
+                    ps_mock.assert_not_called()
+
+        with mock.patch("gemini_usage._discover_daemon_candidates", return_value=[]):
+            with mock.patch("gemini_usage._discover_processes_win32_status", return_value=(False, [])):
+                with mock.patch("gemini_usage._discover_processes_powershell", return_value=[]) as ps_mock:
+                    self.assertEqual(_discover_language_server_processes(), [])
+                    ps_mock.assert_called_once()
+
+        proc = _LanguageServerProcess(pid=99999, name="agy.exe", command_line="", csrf_token="tok")
+        with mock.patch("gemini_usage._get_all_listening_ports_win32", return_value=(True, {})):
+            with mock.patch("gemini_usage._get_listening_ports_netstat") as netstat_mock:
+                self.assertEqual(_candidate_ports_for_process(proc), [])
+                netstat_mock.assert_not_called()
+
+    def test_fetch_endpoint_fails_fast_on_transport_error_and_preserves_401_over_404(self):
+        calls: list[str] = []
+
+        def fake_refused(scheme, port, path, csrf_token, timeout):
+            calls.append(path)
+            raise urllib.error.URLError("Connection refused")
+
+        with mock.patch("gemini_usage._call_language_server_rpc", side_effect=fake_refused):
+            with self.assertRaises(urllib.error.URLError):
+                _fetch_endpoint_payloads("https", 50000, "tok", 2.0)
+        self.assertEqual(len(calls), 1)
+
+        def fake_401_then_404(scheme, port, path, csrf_token, timeout):
+            if path.endswith("/RetrieveUserQuotaSummary"):
+                raise urllib.error.HTTPError(path, 401, "Unauthorized", {}, io.BytesIO(b""))
+            raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+
+        with mock.patch("gemini_usage._call_language_server_rpc", side_effect=fake_401_then_404):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                _fetch_endpoint_payloads("https", 50000, "tok", 2.0)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+
+    def test_model_classification_avoids_short_substring_false_positives(self):
+        with self.assertRaises(UsageError):
+            parse_user_quota(
+                {
+                    "buckets": [
+                        {"modelId": "custom-pro1-audio", "remainingFraction": 0.5},
+                        {"modelId": "nano3-preview", "remainingFraction": 0.5},
+                    ]
+                }
+            )
+        snapshot = parse_user_quota(
+            {
+                "buckets": [
+                    {"modelId": "o3-mini", "remainingFraction": 0.4},
+                ]
+            }
+        )
+        self.assertIsNone(snapshot.five_hour)
+        self.assertEqual(snapshot.claude_gpt_five_hour.used_percent, 60)
 
     def test_rpc_dispatches_empty_body_to_summary_and_metadata_to_status(self):
         captured: list[tuple[str, bytes]] = []
@@ -343,6 +412,8 @@ class ParseUserQuotaTests(unittest.TestCase):
                 priority=0,
             )
 
+            credits_value = {"amount": "320"}
+
             def fake_rpc(scheme: str, port: int, path: str, csrf_token: str, timeout: float):
                 if port == 51001:
                     if path.endswith("/RetrieveUserQuotaSummary"):
@@ -352,7 +423,7 @@ class ParseUserQuotaTests(unittest.TestCase):
                             "email": "merged@example.com",
                             "userTier": {
                                 "name": "Google AI Pro",
-                                "availableCredits": [{"creditAmount": "320"}],
+                                "availableCredits": [{"creditAmount": credits_value["amount"]}],
                             },
                             "cascadeModelConfigData": {
                                 "clientModelConfigs": [
@@ -419,20 +490,74 @@ class ParseUserQuotaTests(unittest.TestCase):
                     }
                 raise AssertionError(f"Unexpected port {port}")
 
-            with mock.patch("gemini_usage._discover_language_server_processes", return_value=[proc_ide, proc_hub]):
+            with mock.patch("gemini_usage._discover_language_server_processes", return_value=[proc_ide, proc_hub]) as discover_mock:
                 with mock.patch("gemini_usage._candidate_ports_for_process", side_effect=lambda p: list(p.server_ports)):
                     with mock.patch("gemini_usage._call_language_server_rpc", side_effect=fake_rpc):
                         snapshot = query_usage(timeout=5.0)
+                        credits_value["amount"] = "280"
+                        second_snapshot = query_usage(timeout=5.0)
 
+            self.assertEqual(discover_mock.call_count, 1)
             self.assertEqual(snapshot.account_email, "merged@example.com")
             self.assertEqual(snapshot.plan, "Google AI Pro")
             self.assertEqual(snapshot.credit_balance, 320)
+            self.assertEqual(second_snapshot.credit_balance, 280)
             self.assertEqual(snapshot.five_hour.used_percent, 15)
             self.assertEqual(snapshot.seven_day.used_percent, 30)
             self.assertIsNotNone(snapshot.seven_day.resets_at)
             self.assertEqual(snapshot.claude_gpt_five_hour.used_percent, 5)
             self.assertEqual(snapshot.claude_gpt_seven_day.used_percent, 50)
             self.assertIsNotNone(snapshot.claude_gpt_seven_day.resets_at)
+        finally:
+            with gemini_usage._CACHE_LOCK:
+                gemini_usage._ENDPOINT_CACHE.clear()
+
+    def test_query_usage_reuses_partial_cache_and_raises_auth_required_on_401(self):
+        with gemini_usage._CACHE_LOCK:
+            gemini_usage._ENDPOINT_CACHE.clear()
+        try:
+            proc = _LanguageServerProcess(
+                pid=303,
+                name="language_server_windows_x64.exe",
+                command_line="",
+                csrf_token="tok-5h",
+                server_ports=(52001,),
+                priority=1,
+            )
+
+            def fake_5h_only(scheme, port, path, csrf_token, timeout):
+                if path.endswith("/RetrieveUserQuotaSummary"):
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+                return {
+                    "userStatus": {
+                        "buckets": [
+                            {"modelId": "gemini-2.5-pro", "remainingFraction": 0.6},
+                        ]
+                    }
+                }
+
+            with mock.patch("gemini_usage._discover_language_server_processes", return_value=[proc]) as discover_mock:
+                with mock.patch("gemini_usage._candidate_ports_for_process", return_value=[52001]):
+                    with mock.patch("gemini_usage._call_language_server_rpc", side_effect=fake_5h_only):
+                        snap1 = query_usage(timeout=5.0)
+                        snap2 = query_usage(timeout=5.0)
+
+            self.assertEqual(discover_mock.call_count, 1)
+            self.assertEqual(snap1.five_hour.used_percent, 40)
+            self.assertEqual(snap2.five_hour.used_percent, 40)
+
+            with gemini_usage._CACHE_LOCK:
+                gemini_usage._ENDPOINT_CACHE.clear()
+
+            def fake_401(scheme, port, path, csrf_token, timeout):
+                code = 401 if path.endswith("/RetrieveUserQuotaSummary") else 404
+                raise urllib.error.HTTPError(path, code, "Err", {}, io.BytesIO(b""))
+
+            with mock.patch("gemini_usage._discover_language_server_processes", return_value=[proc]):
+                with mock.patch("gemini_usage._candidate_ports_for_process", return_value=[52001]):
+                    with mock.patch("gemini_usage._call_language_server_rpc", side_effect=fake_401):
+                        with self.assertRaises(AuthRequiredError):
+                            query_usage(timeout=5.0)
         finally:
             with gemini_usage._CACHE_LOCK:
                 gemini_usage._ENDPOINT_CACHE.clear()
@@ -469,6 +594,10 @@ class ParseUserQuotaTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"LOCALAPPDATA": temp}, clear=True):
                 with mock.patch("gemini_usage.shutil.which", return_value=None):
                     self.assertEqual(find_antigravity_executables(), [str(executable.resolve())])
+            # Directories must not be returned as executables.
+            with mock.patch.dict(os.environ, {"GEMINI_USAGE_WIDGET_ANTIGRAVITY": temp}, clear=True):
+                with mock.patch("gemini_usage.shutil.which", return_value=None):
+                    self.assertEqual(find_antigravity_executables(), [])
 
 
 class WidgetHelpersTests(unittest.TestCase):

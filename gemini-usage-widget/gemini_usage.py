@@ -47,6 +47,72 @@ _METADATA_BODY = json.dumps(
 
 _CACHE_LOCK = threading.Lock()
 _ENDPOINT_CACHE: dict[str, Any] = {}
+_PARTIAL_CACHE_TTL_SECONDS = 300.0
+_WIN32_LOCK = threading.Lock()
+_WIN32_PROCESS_APIS: tuple[ctypes.WinDLL, ctypes.WinDLL] | None = None
+_IPHLPAPI_CACHE: ctypes.WinDLL | None = None
+_HTTPS_SSL_CONTEXT: ssl.SSLContext | None = None
+_TCP_TABLE_LOCAL = threading.local()
+
+_SHORT_THIRD_PARTY_RE = re.compile(r"(?<![a-z0-9])(?:3p|o1|o3)(?![a-z0-9])")
+_SHORT_GEMINI_RE = re.compile(r"(?<![a-z0-9])1p(?![a-z0-9])")
+
+
+def _get_https_ssl_context() -> ssl.SSLContext:
+    global _HTTPS_SSL_CONTEXT
+    if _HTTPS_SSL_CONTEXT is None:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        _HTTPS_SSL_CONTEXT = ctx
+    return _HTTPS_SSL_CONTEXT
+
+
+def _get_win32_process_apis() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
+    global _WIN32_PROCESS_APIS
+    with _WIN32_LOCK:
+        if _WIN32_PROCESS_APIS is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+            kernel32.Process32FirstW.restype = wintypes.BOOL
+            kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+            kernel32.Process32NextW.restype = wintypes.BOOL
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            ntdll = ctypes.WinDLL("ntdll")
+            ntdll.NtQueryInformationProcess.argtypes = [
+                wintypes.HANDLE,
+                wintypes.ULONG,
+                ctypes.c_void_p,
+                wintypes.ULONG,
+                ctypes.POINTER(wintypes.ULONG),
+            ]
+            ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+            _WIN32_PROCESS_APIS = (kernel32, ntdll)
+        return _WIN32_PROCESS_APIS
+
+
+def _get_iphlpapi() -> ctypes.WinDLL:
+    global _IPHLPAPI_CACHE
+    with _WIN32_LOCK:
+        if _IPHLPAPI_CACHE is None:
+            iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+            iphlpapi.GetExtendedTcpTable.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(wintypes.DWORD),
+                wintypes.BOOL,
+                wintypes.ULONG,
+                ctypes.c_int,
+                wintypes.ULONG,
+            ]
+            iphlpapi.GetExtendedTcpTable.restype = wintypes.DWORD
+            _IPHLPAPI_CACHE = iphlpapi
+        return _IPHLPAPI_CACHE
 
 
 class UsageError(RuntimeError):
@@ -111,7 +177,10 @@ def find_antigravity_executables() -> list[str]:
     seen: set[str] = set()
     for candidate in candidates:
         try:
-            resolved = str(candidate.resolve(strict=True))
+            path = candidate.resolve(strict=True)
+            if not path.is_file():
+                continue
+            resolved = str(path)
         except OSError:
             continue
         key = os.path.normcase(resolved)
@@ -325,22 +394,10 @@ def _read_process_command_line_win32(pid: int) -> str | None:
     """Query a process command line using NtQueryInformationProcess(ProcessCommandLineInformation)."""
     if os.name != "nt" or pid <= 0:
         return None
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    ntdll = ctypes.WinDLL("ntdll")
-
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-
-    ntdll.NtQueryInformationProcess.argtypes = [
-        wintypes.HANDLE,
-        wintypes.ULONG,
-        ctypes.c_void_p,
-        wintypes.ULONG,
-        ctypes.POINTER(wintypes.ULONG),
-    ]
-    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    try:
+        kernel32, ntdll = _get_win32_process_apis()
+    except OSError:
+        return None
 
     process_query_limited_information = 0x1000
     process_command_line_information = 60
@@ -378,24 +435,19 @@ def _read_process_command_line_win32(pid: int) -> str | None:
         kernel32.CloseHandle(handle)
 
 
-def _discover_processes_win32() -> list[_LanguageServerProcess]:
+def _discover_processes_win32_status() -> tuple[bool, list[_LanguageServerProcess]]:
     if os.name != "nt":
-        return []
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
-    kernel32.Process32FirstW.restype = wintypes.BOOL
-    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
-    kernel32.Process32NextW.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
+        return False, []
+    try:
+        kernel32, _ = _get_win32_process_apis()
+    except OSError:
+        return False, []
 
     th32cs_snapprocess = 0x00000002
     invalid_handle = ctypes.c_void_p(-1).value
     snapshot = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
     if not snapshot or snapshot == invalid_handle:
-        return []
+        return False, []
 
     found: list[_LanguageServerProcess] = []
     try:
@@ -416,7 +468,11 @@ def _discover_processes_win32() -> list[_LanguageServerProcess]:
         kernel32.CloseHandle(snapshot)
 
     found.sort(key=lambda proc: (proc.priority, -proc.pid))
-    return found
+    return True, found
+
+
+def _discover_processes_win32() -> list[_LanguageServerProcess]:
+    return _discover_processes_win32_status()[1]
 
 
 def _discover_processes_powershell() -> list[_LanguageServerProcess]:
@@ -426,7 +482,7 @@ def _discover_processes_powershell() -> list[_LanguageServerProcess]:
     ps_command = (
         "Get-CimInstance Win32_Process -Filter "
         "\"Name LIKE 'language_server%' OR Name LIKE 'agy%' OR Name LIKE 'antigravity%' "
-        "OR (Name = 'node.exe' AND CommandLine LIKE '%antigravity%')\" "
+        "OR (Name = 'node.exe' AND (CommandLine LIKE '%antigravity%' OR CommandLine LIKE '%agy%'))\" "
         "| Select-Object ProcessId,Name,CommandLine "
         "| ConvertTo-Json -Compress"
     )
@@ -467,20 +523,46 @@ def _discover_processes_powershell() -> list[_LanguageServerProcess]:
     return found
 
 
+def _deduplicate_processes(processes: list[_LanguageServerProcess]) -> list[_LanguageServerProcess]:
+    merged: list[_LanguageServerProcess] = []
+    by_key: dict[tuple[int, str], int] = {}
+    for proc in processes:
+        key = (proc.pid, proc.csrf_token) if proc.pid > 0 else (-1, proc.csrf_token)
+        if key in by_key:
+            idx = by_key[key]
+            existing = merged[idx]
+            ports = list(existing.server_ports)
+            for port in proc.server_ports:
+                if port not in ports:
+                    ports.append(port)
+            merged[idx] = _LanguageServerProcess(
+                pid=existing.pid or proc.pid,
+                name=existing.name,
+                command_line=existing.command_line or proc.command_line,
+                csrf_token=existing.csrf_token,
+                server_ports=tuple(ports),
+                extension_port=existing.extension_port or proc.extension_port,
+                priority=min(existing.priority, proc.priority),
+            )
+        else:
+            by_key[key] = len(merged)
+            merged.append(proc)
+    return merged
+
+
 def _discover_language_server_processes() -> list[_LanguageServerProcess]:
     candidates = _discover_daemon_candidates()
-    processes = _discover_processes_win32()
-    if not processes:
+    win32_ok, processes = _discover_processes_win32_status()
+    if not win32_ok:
         processes = _discover_processes_powershell()
-    return candidates + processes
+    return _deduplicate_processes(candidates + processes)
 
 
-def _query_tcp_table_ports(
+def _query_tcp_table_all(
     iphlpapi: ctypes.WinDLL,
     family: int,
     row_cls: type[ctypes.Structure],
-    target_pid: int,
-) -> list[int]:
+) -> tuple[bool, dict[int, list[int]]]:
     tcp_table_owner_pid_listener = 3
     error_insufficient_buffer = 122
 
@@ -493,64 +575,83 @@ def _query_tcp_table_ports(
         tcp_table_owner_pid_listener,
         0,
     )
-    if res not in (0, error_insufficient_buffer) or size.value == 0:
-        return []
+    if res not in (0, error_insufficient_buffer):
+        return False, {}
+    if size.value == 0:
+        return True, {}
 
-    buf = ctypes.create_string_buffer(int(size.value))
-    res = iphlpapi.GetExtendedTcpTable(
-        buf,
-        ctypes.byref(size),
-        False,
-        family,
-        tcp_table_owner_pid_listener,
-        0,
-    )
-    if res != 0:
-        return []
+    buf = None
+    for _ in range(3):
+        alloc_size = int(size.value) + 1024
+        size = wintypes.DWORD(alloc_size)
+        buf = ctypes.create_string_buffer(alloc_size)
+        res = iphlpapi.GetExtendedTcpTable(
+            buf,
+            ctypes.byref(size),
+            False,
+            family,
+            tcp_table_owner_pid_listener,
+            0,
+        )
+        if res == 0:
+            break
+        if res != error_insufficient_buffer:
+            return False, {}
+    else:
+        return False, {}
 
+    assert buf is not None
     num_entries = wintypes.DWORD.from_buffer_copy(buf, 0).value
     row_size = ctypes.sizeof(row_cls)
     offset = ctypes.sizeof(wintypes.DWORD)
-    ports: list[int] = []
+    ports_by_pid: dict[int, list[int]] = {}
     for _ in range(int(num_entries)):
         if offset + row_size > len(buf):
             break
         row = row_cls.from_buffer_copy(buf, offset)
         offset += row_size
-        if int(row.dwOwningPid) == target_pid:
-            raw_port = int(row.dwLocalPort) & 0xFFFF
-            port = ((raw_port & 0xFF) << 8) | ((raw_port >> 8) & 0xFF)
-            _append_valid_port(ports, port)
-    return ports
+        owning_pid = int(row.dwOwningPid)
+        if owning_pid <= 0:
+            continue
+        raw_port = int(row.dwLocalPort) & 0xFFFF
+        port = ((raw_port & 0xFF) << 8) | ((raw_port >> 8) & 0xFF)
+        bucket = ports_by_pid.setdefault(owning_pid, [])
+        _append_valid_port(bucket, port)
+    return True, ports_by_pid
+
+
+def _get_all_listening_ports_win32() -> tuple[bool, dict[int, list[int]]]:
+    """Return (ok, {pid: [ports]}) for local IPv4/IPv6 TCP listeners via GetExtendedTcpTable."""
+    if os.name != "nt":
+        return False, {}
+    try:
+        iphlpapi = _get_iphlpapi()
+    except OSError:
+        return False, {}
+
+    combined: dict[int, list[int]] = {}
+    any_ok = False
+    for family, row_cls in (
+        (2, _MIB_TCPROW_OWNER_PID),
+        (23, _MIB_TCP6ROW_OWNER_PID),
+    ):
+        ok, table = _query_tcp_table_all(iphlpapi, family, row_cls)
+        if ok:
+            any_ok = True
+            for pid, pid_ports in table.items():
+                dest = combined.setdefault(pid, [])
+                for port in pid_ports:
+                    if port not in dest:
+                        dest.append(port)
+    return any_ok, combined
 
 
 def _get_listening_ports_win32(target_pid: int) -> list[int]:
     """Return local IPv4/IPv6 TCP listening ports owned by target_pid via GetExtendedTcpTable."""
     if os.name != "nt" or target_pid <= 0:
         return []
-    try:
-        iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
-        iphlpapi.GetExtendedTcpTable.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.DWORD),
-            wintypes.BOOL,
-            wintypes.ULONG,
-            ctypes.c_int,
-            wintypes.ULONG,
-        ]
-        iphlpapi.GetExtendedTcpTable.restype = wintypes.DWORD
-    except OSError:
-        return []
-
-    ports: list[int] = []
-    for family, row_cls in (
-        (2, _MIB_TCPROW_OWNER_PID),
-        (23, _MIB_TCP6ROW_OWNER_PID),
-    ):
-        for port in _query_tcp_table_ports(iphlpapi, family, row_cls, target_pid):
-            if port not in ports:
-                ports.append(port)
-    return ports
+    ok, table = _get_all_listening_ports_win32()
+    return list(table.get(target_pid, ())) if ok else []
 
 
 def _get_listening_ports_netstat(target_pid: int) -> list[int]:
@@ -588,8 +689,14 @@ def _get_listening_ports_netstat(target_pid: int) -> list[int]:
 def _candidate_ports_for_process(proc: _LanguageServerProcess) -> list[int]:
     ports: list[int] = list(proc.server_ports)
     if proc.pid > 0:
-        os_ports = _get_listening_ports_win32(proc.pid)
-        if not os_ports:
+        cached_table = getattr(_TCP_TABLE_LOCAL, "snapshot", None)
+        if cached_table is not None:
+            win32_ok, table = cached_table
+            os_ports = list(table.get(proc.pid, ())) if win32_ok else []
+        else:
+            win32_ok, table = _get_all_listening_ports_win32()
+            os_ports = list(table.get(proc.pid, ())) if win32_ok else []
+        if not win32_ok:
             os_ports = _get_listening_ports_netstat(proc.pid)
         for port in os_ports:
             if port not in ports:
@@ -614,8 +721,7 @@ def _call_language_server_rpc(
 
     handlers: list[urllib.request.BaseHandler] = [urllib.request.ProxyHandler({})]
     if scheme == "https":
-        ssl_ctx = ssl._create_unverified_context()
-        handlers.append(urllib.request.HTTPSHandler(context=ssl_ctx))
+        handlers.append(urllib.request.HTTPSHandler(context=_get_https_ssl_context()))
     opener = urllib.request.build_opener(*handlers)
 
     last_exc: Exception | None = None
@@ -683,7 +789,7 @@ _RELATIVE_RESET_KEYS = (
     "resetDuration",
     "reset_duration",
 )
-_ISO_FRAC_OVER6_RE = re.compile(r"\.(\d{6})\d+")
+_ISO_FRAC_RE = re.compile(r"\.(\d+)")
 _NUMERIC_STR_RE = re.compile(r"-?\d+(?:\.\d+)?")
 _DURATION_SEC_RE = re.compile(r"^(-?\d+(?:\.\d+)?)s$", re.IGNORECASE)
 
@@ -733,12 +839,16 @@ def _parse_reset_time(raw_reset: Any) -> int | None:
         try:
             if text.endswith(("Z", "z")):
                 text = text[:-1] + "+00:00"
-            text = _ISO_FRAC_OVER6_RE.sub(r".\1", text)
+            text = _ISO_FRAC_RE.sub(
+                lambda match: "." + match.group(1)[:6].ljust(6, "0"),
+                text,
+                count=1,
+            )
             dt = datetime.fromisoformat(text)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-        except ValueError:
+            return _normalize_epoch_seconds(dt.timestamp())
+        except (ValueError, OSError, OverflowError):
             return None
     return None
 
@@ -783,7 +893,11 @@ def _decimal_to_used_percent(fraction: Decimal) -> int:
     return max(0, min(100, used_percent))
 
 
-def _parse_used_percent_from_quota_obj(quota_obj: dict[str, Any]) -> int | None:
+def _parse_used_percent_from_quota_obj(
+    quota_obj: dict[str, Any],
+    *,
+    has_reset_time: bool | None = None,
+) -> int | None:
     if not isinstance(quota_obj, dict) or not quota_obj:
         return None
 
@@ -811,6 +925,8 @@ def _parse_used_percent_from_quota_obj(quota_obj: dict[str, Any]) -> int | None:
     if rem_frac_raw is not None and not isinstance(rem_frac_raw, bool):
         try:
             rem = Decimal(str(rem_frac_raw))
+            if not rem.is_finite():
+                raise ValueError("non-finite fraction")
         except (InvalidOperation, ValueError, TypeError) as exc:
             raise UsageError("Antigravity가 반환한 사용량 데이터가 올바르지 않습니다.") from exc
         return _decimal_to_used_percent(rem)
@@ -820,6 +936,8 @@ def _parse_used_percent_from_quota_obj(quota_obj: dict[str, Any]) -> int | None:
         if raw is not None and not isinstance(raw, bool):
             try:
                 used = Decimal(str(raw))
+                if not used.is_finite():
+                    raise ValueError("non-finite fraction")
                 return _decimal_to_used_percent(Decimal("1") - used)
             except (InvalidOperation, ValueError, TypeError) as exc:
                 raise UsageError("Antigravity가 반환한 사용량 데이터가 올바르지 않습니다.") from exc
@@ -829,6 +947,8 @@ def _parse_used_percent_from_quota_obj(quota_obj: dict[str, Any]) -> int | None:
         if raw is not None and not isinstance(raw, bool):
             try:
                 rem_pct = Decimal(str(raw)) / Decimal("100")
+                if not rem_pct.is_finite():
+                    raise ValueError("non-finite percent")
                 return _decimal_to_used_percent(rem_pct)
             except (InvalidOperation, ValueError, TypeError) as exc:
                 raise UsageError("Antigravity가 반환한 사용량 데이터가 올바르지 않습니다.") from exc
@@ -838,6 +958,8 @@ def _parse_used_percent_from_quota_obj(quota_obj: dict[str, Any]) -> int | None:
         if raw is not None and not isinstance(raw, bool):
             try:
                 used_pct = Decimal(str(raw)) / Decimal("100")
+                if not used_pct.is_finite():
+                    raise ValueError("non-finite percent")
                 return _decimal_to_used_percent(Decimal("1") - used_pct)
             except (InvalidOperation, ValueError, TypeError) as exc:
                 raise UsageError("Antigravity가 반환한 사용량 데이터가 올바르지 않습니다.") from exc
@@ -847,13 +969,19 @@ def _parse_used_percent_from_quota_obj(quota_obj: dict[str, Any]) -> int | None:
         if "remainingAmount" in rem_dict
         else source.get("remainingAmount", source.get("remaining_amount"))
     )
+    rem_amount_zero = (
+        not isinstance(rem_amount_raw, bool)
+        and (rem_amount_raw == 0 or str(rem_amount_raw) == "0")
+    )
+    reset_present = (
+        has_reset_time if has_reset_time is not None else (_extract_reset_time(quota_obj) is not None)
+    )
 
     if (
         source.get("isExhausted") is True
         or source.get("is_exhausted") is True
-        or rem_amount_raw == 0
-        or str(rem_amount_raw) == "0"
-        or _extract_reset_time(quota_obj) is not None
+        or rem_amount_zero
+        or reset_present
         or (isinstance(rem_container, dict) and not rem_container)
     ):
         # Proto3 JSON omits remainingFraction when it is 0.0 (100% used).
@@ -865,10 +993,10 @@ def _parse_used_percent_from_quota_obj(quota_obj: dict[str, Any]) -> int | None:
 def _window_from_quota_obj(quota_obj: Any) -> LimitWindow | None:
     if not isinstance(quota_obj, dict) or not quota_obj:
         return None
-    used_percent = _parse_used_percent_from_quota_obj(quota_obj)
+    resets_at = _extract_reset_time(quota_obj)
+    used_percent = _parse_used_percent_from_quota_obj(quota_obj, has_reset_time=resets_at is not None)
     if used_percent is None:
         return None
-    resets_at = _extract_reset_time(quota_obj)
     return LimitWindow(used_percent=used_percent, resets_at=resets_at)
 
 
@@ -880,6 +1008,18 @@ def _pick_more_constrained(current: LimitWindow | None, candidate: LimitWindow |
     current_key = (current.used_percent, 1 if current.resets_at is not None else 0, -(current.resets_at or 0))
     candidate_key = (candidate.used_percent, 1 if candidate.resets_at is not None else 0, -(candidate.resets_at or 0))
     return candidate if candidate_key > current_key else current
+
+
+def _safe_int_credit(raw: Any) -> int | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        dec = Decimal(str(raw).strip())
+        if not dec.is_finite():
+            return None
+        return int(dec)
+    except (InvalidOperation, ValueError, TypeError, OverflowError):
+        return None
 
 
 def _extract_credits_from_obj(obj: Any) -> int | None:
@@ -895,26 +1035,21 @@ def _extract_credits_from_obj(obj: Any) -> int | None:
                 if not isinstance(item, dict):
                     continue
                 amount = item.get("creditAmount") if "creditAmount" in item else item.get("amount")
-                if amount is not None and not isinstance(amount, bool):
-                    try:
-                        total += int(Decimal(str(amount)))
-                        found = True
-                    except (InvalidOperation, ValueError):
-                        pass
+                parsed = _safe_int_credit(amount)
+                if parsed is not None:
+                    total += parsed
+                    found = True
             if found:
                 return total
-        elif isinstance(raw_list, (int, float)) and not isinstance(raw_list, bool):
-            return int(raw_list)
+        else:
+            parsed = _safe_int_credit(raw_list)
+            if parsed is not None:
+                return parsed
 
     for num_key in ("creditBalance", "g1Credits", "aiCredits", "availablePromptCredits"):
-        val = obj.get(num_key)
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            return int(val)
-        if isinstance(val, str) and val.strip():
-            try:
-                return int(Decimal(val.strip()))
-            except (InvalidOperation, ValueError):
-                pass
+        parsed = _safe_int_credit(obj.get(num_key))
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -941,10 +1076,9 @@ def _collect_tag_text(obj: dict[str, Any]) -> str:
 
 
 def _classify_model_family(tag: str) -> str | None:
-    if any(
+    if _SHORT_THIRD_PARTY_RE.search(tag) or any(
         token in tag
         for token in (
-            "3p",
             "third-party",
             "third_party",
             "third party",
@@ -960,7 +1094,9 @@ def _classify_model_family(tag: str) -> str | None:
         )
     ):
         return "third_party"
-    if any(token in tag for token in ("gemini", "argon", "carbon", "hydrogen", "1p", "first-party", "first_party")):
+    if _SHORT_GEMINI_RE.search(tag) or any(
+        token in tag for token in ("gemini", "argon", "carbon", "hydrogen", "first-party", "first_party")
+    ):
         return "gemini"
     return None
 
@@ -1046,6 +1182,8 @@ def _parse_summary_groups(
         if not isinstance(buckets, list):
             buckets = group.get("quotaBuckets")
         if not isinstance(buckets, list):
+            buckets = group.get("quota_buckets")
+        if not isinstance(buckets, list):
             buckets = group.get("items")
         if not isinstance(buckets, list):
             continue
@@ -1105,11 +1243,17 @@ def _parse_client_model_configs(
             continue
 
         is_gemini = any(token in combined for token in ("gemini", "argon", "carbon", "hydrogen"))
-        is_third_party = any(token in combined for token in ("claude", "gpt", "sonnet", "opus", "haiku", "o1", "o3"))
+        is_third_party = bool(_SHORT_THIRD_PARTY_RE.search(combined)) or any(
+            token in combined for token in ("claude", "gpt", "sonnet", "opus", "haiku")
+        )
         if not is_gemini and not is_third_party:
             continue
 
-        short_obj = entry.get("quotaInfo") if isinstance(entry.get("quotaInfo"), dict) else entry
+        short_obj = (
+            entry.get("quotaInfo")
+            if isinstance(entry.get("quotaInfo"), dict)
+            else (entry.get("quota_info") if isinstance(entry.get("quota_info"), dict) else entry)
+        )
         weekly_obj = (
             entry.get("weeklyQuotaInfo")
             if isinstance(entry.get("weeklyQuotaInfo"), dict)
@@ -1261,19 +1405,24 @@ def _fetch_endpoint_payloads(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     status_payload: dict[str, Any] | None = None
     summary_payload: dict[str, Any] | None = None
+    auth_exc: urllib.error.HTTPError | None = None
     last_exc: Exception | None = None
+    deadline = time.monotonic() + timeout
 
     for path, is_summary in (
         (_RETRIEVE_QUOTA_SUMMARY_PATH, True),
         (_GET_USER_STATUS_PATH, False),
     ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             result = _call_language_server_rpc(
                 scheme=scheme,
                 port=port,
                 path=path,
                 csrf_token=csrf_token,
-                timeout=timeout,
+                timeout=remaining,
             )
             if is_summary:
                 summary_payload = result
@@ -1281,13 +1430,22 @@ def _fetch_endpoint_payloads(
                 status_payload = result
         except urllib.error.HTTPError as exc:
             exc.close()
+            if exc.code in (401, 403) and auth_exc is None:
+                auth_exc = exc
             last_exc = exc
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            last_exc = exc
+            # Transport/SSL/timeout failure on the first RPC means this port+scheme is unreachable.
+            if summary_payload is None:
+                raise
         except Exception as exc:
             last_exc = exc
             if not is_summary and summary_payload is None:
                 raise
 
     if status_payload is None and summary_payload is None:
+        if auth_exc is not None:
+            raise auth_exc
         if last_exc is not None:
             raise last_exc
         raise UsageError("Antigravity 로컬 서버 응답이 없습니다.")
@@ -1313,13 +1471,30 @@ def _fetch_from_endpoint(
     csrf_token: str,
     timeout: float,
     fallback_status_payload: dict[str, Any] | None = None,
+    status_endpoint: dict[str, Any] | None = None,
 ) -> UsageSnapshot:
+    deadline = time.monotonic() + timeout
     status_payload, summary_payload = _fetch_endpoint_payloads(
         scheme=scheme,
         port=port,
         csrf_token=csrf_token,
         timeout=timeout,
     )
+    if status_payload is None and status_endpoint is not None:
+        remaining = deadline - time.monotonic()
+        if remaining > 0.2:
+            try:
+                status_payload = _call_language_server_rpc(
+                    scheme=str(status_endpoint["scheme"]),
+                    port=int(status_endpoint["port"]),
+                    path=_GET_USER_STATUS_PATH,
+                    csrf_token=str(status_endpoint["csrf_token"]),
+                    timeout=remaining,
+                )
+            except urllib.error.HTTPError as exc:
+                exc.close()
+            except Exception:
+                pass
     return _build_snapshot_from_payloads(
         status_payload=status_payload,
         summary_payload=summary_payload,
@@ -1329,26 +1504,30 @@ def _fetch_from_endpoint(
 
 def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     """Fetch current Gemini & Claude/GPT quota from the local Antigravity Language Server."""
+    deadline = time.monotonic() + timeout
     with _CACHE_LOCK:
         cached_endpoint = dict(_ENDPOINT_CACHE) if _ENDPOINT_CACHE else None
 
-    if cached_endpoint and cached_endpoint.get("has_weekly") is True:
-        try:
-            snapshot = _fetch_from_endpoint(
-                scheme=str(cached_endpoint["scheme"]),
-                port=int(cached_endpoint["port"]),
-                csrf_token=str(cached_endpoint["csrf_token"]),
-                timeout=min(timeout, 3.5),
-                fallback_status_payload=cached_endpoint.get("fallback_status"),
-            )
-            if _has_weekly_limits(snapshot):
-                return snapshot
-        except urllib.error.HTTPError as exc:
-            exc.close()
-        except Exception:
-            pass
-        with _CACHE_LOCK:
-            _ENDPOINT_CACHE.clear()
+    if cached_endpoint:
+        cache_has_weekly = cached_endpoint.get("has_weekly") is True
+        cache_age = time.monotonic() - float(cached_endpoint.get("cached_at", 0.0))
+        if cache_has_weekly or cache_age < _PARTIAL_CACHE_TTL_SECONDS:
+            try:
+                snapshot = _fetch_from_endpoint(
+                    scheme=str(cached_endpoint["scheme"]),
+                    port=int(cached_endpoint["port"]),
+                    csrf_token=str(cached_endpoint["csrf_token"]),
+                    timeout=min(timeout, 3.5),
+                    status_endpoint=cached_endpoint.get("status_endpoint"),
+                )
+                if not cache_has_weekly or _has_weekly_limits(snapshot):
+                    return snapshot
+            except urllib.error.HTTPError as exc:
+                exc.close()
+            except Exception:
+                pass
+            with _CACHE_LOCK:
+                _ENDPOINT_CACHE.clear()
 
     processes = _discover_language_server_processes()
     if not processes:
@@ -1360,54 +1539,77 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     saw_auth_error = False
     last_error: Exception | None = None
     fallback_status_payload: dict[str, Any] | None = None
+    fallback_status_endpoint: dict[str, Any] | None = None
     best_partial: tuple[UsageSnapshot, dict[str, Any]] | None = None
+    tried: set[tuple[str, int, str]] = set()
 
-    for proc in processes:
-        ports = _candidate_ports_for_process(proc)
-        for port in ports:
-            for scheme in ("https", "http"):
-                try:
-                    status_payload, summary_payload = _fetch_endpoint_payloads(
-                        scheme=scheme,
-                        port=port,
-                        csrf_token=proc.csrf_token,
-                        timeout=per_attempt_timeout,
-                    )
-                    if status_payload is not None and fallback_status_payload is None:
-                        fallback_status_payload = status_payload
-
-                    snapshot = _build_snapshot_from_payloads(
-                        status_payload=status_payload,
-                        summary_payload=summary_payload,
-                        fallback_status_payload=fallback_status_payload,
-                    )
-                    cache_entry = {
-                        "pid": proc.pid,
-                        "scheme": scheme,
-                        "port": port,
-                        "csrf_token": proc.csrf_token,
-                        "has_weekly": _has_weekly_limits(snapshot),
-                        "fallback_status": fallback_status_payload if status_payload is None else None,
-                    }
-                    if _has_weekly_limits(snapshot):
-                        with _CACHE_LOCK:
-                            _ENDPOINT_CACHE.clear()
-                            _ENDPOINT_CACHE.update(cache_entry)
-                        return snapshot
-
-                    if best_partial is None:
-                        best_partial = (snapshot, cache_entry)
-                    # Stop trying http on the same port once https succeeded, and check next port/process.
+    _TCP_TABLE_LOCAL.snapshot = _get_all_listening_ports_win32()
+    try:
+        for proc in processes:
+            if time.monotonic() >= deadline:
+                break
+            ports = _candidate_ports_for_process(proc)
+            for port in ports:
+                if time.monotonic() >= deadline:
                     break
-                except urllib.error.HTTPError as exc:
-                    exc.close()
-                    if exc.code in (401, 403):
-                        saw_auth_error = True
-                    last_error = exc
-                except AuthRequiredError:
-                    raise
-                except Exception as exc:
-                    last_error = exc
+                for scheme in ("https", "http"):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    endpoint_key = (scheme, port, proc.csrf_token)
+                    if endpoint_key in tried:
+                        continue
+                    tried.add(endpoint_key)
+                    try:
+                        status_payload, summary_payload = _fetch_endpoint_payloads(
+                            scheme=scheme,
+                            port=port,
+                            csrf_token=proc.csrf_token,
+                            timeout=min(per_attempt_timeout, remaining),
+                        )
+                        if status_payload is not None and fallback_status_payload is None:
+                            fallback_status_payload = status_payload
+                            fallback_status_endpoint = {
+                                "scheme": scheme,
+                                "port": port,
+                                "csrf_token": proc.csrf_token,
+                            }
+
+                        snapshot = _build_snapshot_from_payloads(
+                            status_payload=status_payload,
+                            summary_payload=summary_payload,
+                            fallback_status_payload=fallback_status_payload,
+                        )
+                        cache_entry = {
+                            "pid": proc.pid,
+                            "scheme": scheme,
+                            "port": port,
+                            "csrf_token": proc.csrf_token,
+                            "has_weekly": _has_weekly_limits(snapshot),
+                            "cached_at": time.monotonic(),
+                            "status_endpoint": fallback_status_endpoint if status_payload is None else None,
+                        }
+                        if _has_weekly_limits(snapshot):
+                            with _CACHE_LOCK:
+                                _ENDPOINT_CACHE.clear()
+                                _ENDPOINT_CACHE.update(cache_entry)
+                            return snapshot
+
+                        if best_partial is None:
+                            best_partial = (snapshot, cache_entry)
+                        # Stop trying http on the same port once https succeeded, and check next port/process.
+                        break
+                    except urllib.error.HTTPError as exc:
+                        exc.close()
+                        if exc.code in (401, 403):
+                            saw_auth_error = True
+                        last_error = exc
+                    except AuthRequiredError:
+                        raise
+                    except Exception as exc:
+                        last_error = exc
+    finally:
+        _TCP_TABLE_LOCAL.snapshot = None
 
     if best_partial is not None:
         snapshot, cache_entry = best_partial
