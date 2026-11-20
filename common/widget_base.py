@@ -36,7 +36,6 @@ from common.win32 import (
     _MonitorInfo,
     _MouseHookData,
     _Rect,
-    apply_rounded_corners,
     autostart_enabled_for,
     clamp_position,
     enable_dpi_awareness,
@@ -66,7 +65,6 @@ __all__ = [
     "_MonitorInfo",
     "_MouseHookData",
     "_Rect",
-    "apply_rounded_corners",
     "autostart_enabled_for",
     "clamp_position",
     "enable_dpi_awareness",
@@ -147,7 +145,6 @@ class BaseUsageWidget:
         self._restore_position()
         self.root.deiconify()
         self.root.update_idletasks()
-        self._apply_rounded_corners()
         self._bind_actions()
         self._enable_click_through()
         self._settings_ready = True
@@ -611,10 +608,6 @@ class BaseUsageWidget:
         area = monitor_work_area(screen_width - 1, 0, width, WINDOW_HEIGHT)
         x, y = clamp_position(area[2] - width - 18, area[1] + 18, width, WINDOW_HEIGHT, area)
         self.root.geometry(f"{width}x{WINDOW_HEIGHT}+{x}+{y}")
-
-    def _apply_rounded_corners(self) -> None:
-        """Ask Windows 11 DWM for iOS-like rounded top-level corners."""
-        apply_rounded_corners(self.root.winfo_id())
 
     def _enable_click_through(self) -> None:
         """Keep the body transparent; intercept only right gestures starting on it."""

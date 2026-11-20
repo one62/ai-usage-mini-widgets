@@ -58,22 +58,10 @@ def _get_user32() -> ctypes.WinDLL:
         api.GetMonitorInfoW.restype = ctypes.c_int
         api.GetSystemMetrics.argtypes = [ctypes.c_int]
         api.GetSystemMetrics.restype = ctypes.c_int
-        api.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        api.GetAncestor.restype = ctypes.c_void_p
         api.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
         api.MessageBoxW.restype = ctypes.c_int
         _USER32_CACHE = api
     return _USER32_CACHE
-
-
-def _resolve_top_level_hwnd(hwnd: int) -> int:
-    if os.name != "nt" or not hwnd:
-        return hwnd
-    try:
-        root_hwnd = _get_user32().GetAncestor(hwnd, 2)  # GA_ROOT
-        return int(root_hwnd) if root_hwnd else hwnd
-    except (AttributeError, OSError):
-        return hwnd
 
 
 def _show_native_info(title: str, message: str) -> None:
@@ -139,31 +127,6 @@ def monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int
         return (0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
     except (AttributeError, OSError):
         return (0, 0, max(width, x + width), max(height, y + height))
-
-
-def apply_rounded_corners(hwnd: int) -> None:
-    """Ask Windows 11 DWM for iOS-like rounded top-level corners."""
-    if os.name != "nt" or not hwnd:
-        return
-    try:
-        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
-        dwmapi.DwmSetWindowAttribute.argtypes = [
-            wintypes.HWND,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        ]
-        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
-        preference = ctypes.c_int(2)  # DWMWCP_ROUND
-        top_hwnd = _resolve_top_level_hwnd(hwnd)
-        dwmapi.DwmSetWindowAttribute(
-            top_hwnd,
-            33,
-            ctypes.byref(preference),
-            ctypes.sizeof(preference),
-        )
-    except (AttributeError, OSError):
-        pass
 
 
 def pythonw_command_for(script_path: Path) -> str:
