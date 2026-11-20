@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import sys
 import tempfile
 import tkinter as tk
@@ -16,12 +17,16 @@ for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
         sys.path.insert(0, _path)
 
 import codex_usage
+import widget as codex_widget_module
 import widget_settings
 from codex_usage import (
     AuthRequiredError,
     UsageError,
+    UsageSnapshot,
+    UsageWindow,
     _LineReader,
     _wait_for_id,
+    consume_reset_credit,
     find_codex_executables,
     parse_rate_limits,
     query_usage,
@@ -111,6 +116,125 @@ class ParseRateLimitsTests(unittest.TestCase):
         widget = UsageWidget.__new__(UsageWidget)
         self.assertTrue(widget._is_non_retryable_fetch_error(AuthRequiredError("auth")))
         self.assertFalse(widget._is_non_retryable_fetch_error(UsageError("conn")))
+
+    def test_non_finite_credit_balance_and_reset_credits_parsing(self):
+        snapshot = parse_rate_limits(
+            {
+                "rateLimits": {
+                    "primary": {"usedPercent": 10},
+                    "credits": {"unlimited": False, "balance": "Infinity"},
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 2,
+                    "credits": [
+                        {"id": "later", "status": "available", "expiresAt": 2000},
+                        {"id": "sooner", "status": "available", "expiresAt": 1000},
+                        {"id": "used", "status": "redeemed", "expiresAt": 500},
+                    ],
+                },
+            }
+        )
+        self.assertIsNone(snapshot.credit_balance)
+        self.assertEqual(snapshot.reset_credit_count, 2)
+        self.assertEqual(snapshot.reset_credit_id, "sooner")
+        self.assertEqual(snapshot.reset_credit_expires_at, 1000)
+
+        nan_snapshot = parse_rate_limits(
+            {
+                "rateLimits": {
+                    "primary": {"usedPercent": 10},
+                    "credits": {"unlimited": False, "balance": "NaN"},
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 2,
+                    "credits": [{"id": "only-one", "status": "available", "expiresAt": 1000}],
+                },
+            }
+        )
+        self.assertIsNone(nan_snapshot.credit_balance)
+        self.assertEqual(nan_snapshot.reset_credit_count, 2)
+        self.assertIsNone(nan_snapshot.reset_credit_id)
+
+    def test_token_limit_error_is_not_misclassified_as_auth_and_auth_message_preserved(self):
+        reader = _LineReader([json.dumps({"id": 2, "error": {"message": "max token limit exceeded"}}) + "\n"])
+        with self.assertRaises(UsageError) as ctx:
+            _wait_for_id(reader, 2, deadline=10**12)
+        self.assertNotIsInstance(ctx.exception, AuthRequiredError)
+
+        reader2 = _LineReader([json.dumps({"id": 2, "error": {"message": "access token expired"}}) + "\n"])
+        with self.assertRaises(AuthRequiredError):
+            _wait_for_id(reader2, 2, deadline=10**12)
+
+        codex_usage._set_cached_executable(None)
+        with mock.patch("codex_usage.find_codex_executables", return_value=[r"C:\first.exe", r"C:\second.exe"]):
+            with mock.patch.object(
+                codex_usage,
+                "_query_with_executable",
+                side_effect=[AuthRequiredError("auth msg"), UsageError("second failed")],
+            ):
+                with self.assertRaises(AuthRequiredError) as auth_ctx:
+                    query_usage(timeout=2.0)
+        self.assertEqual(str(auth_ctx.exception), "auth msg")
+
+    def test_query_usage_caches_working_executable_and_consume_matches_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as temp:
+            exe = Path(temp) / "Codex.exe"
+            exe.touch()
+            resolved = str(exe.resolve())
+            expected_snapshot = UsageSnapshot(
+                plan="plus",
+                primary=UsageWindow(10, 300, 1000),
+                secondary=None,
+                credit_balance=None,
+                unlimited_credits=False,
+            )
+            codex_usage._set_cached_executable(None)
+            try:
+                with mock.patch("codex_usage.find_codex_executables", return_value=[resolved]) as find_mock:
+                    with mock.patch.object(codex_usage, "_query_with_executable", return_value=expected_snapshot):
+                        snap1 = query_usage(timeout=2.0)
+                        snap2 = query_usage(timeout=2.0)
+                self.assertEqual(find_mock.call_count, 1)
+                self.assertEqual(snap1.executable, resolved)
+                self.assertEqual(snap2.executable, resolved)
+
+                with mock.patch("codex_usage.find_codex_executables", return_value=[resolved]):
+                    with mock.patch.object(codex_usage, "_query_with_executable", return_value="reset") as consume_mock:
+                        outcome = consume_reset_credit("key-1", resolved.lower(), "cred-1")
+                self.assertEqual(outcome, "reset")
+                self.assertEqual(consume_mock.call_args.args[0], resolved)
+            finally:
+                codex_usage._set_cached_executable(None)
+
+    def test_drain_reset_results_clears_or_retains_pending_reset_and_stops_when_idle(self):
+        widget = UsageWidget.__new__(UsageWidget)
+        widget.root = mock.Mock()
+        widget.menu = mock.Mock()
+        widget.reset_results = queue.Queue()
+        widget.resetting = True
+        widget._closing = False
+        widget._reset_drain_after_id = "timer-r"
+        widget.pending_reset = PendingReset("k", r"C:\codex.exe", "c")
+        widget.refresh = mock.Mock()
+        widget._ensure_topmost = mock.Mock()
+        widget._update_reset_menu = mock.Mock()
+
+        widget.reset_results.put(("error", ""))
+        with mock.patch.object(codex_widget_module.messagebox, "showwarning"):
+            widget._drain_reset_results()
+        self.assertFalse(widget.resetting)
+        self.assertIsNotNone(widget.pending_reset)
+        widget.root.after.assert_not_called()
+
+        widget.resetting = True
+        widget.reset_results.put(("ok", "reset"))
+        with mock.patch.object(codex_widget_module, "save_pending_reset") as save_mock:
+            with mock.patch.object(codex_widget_module.messagebox, "showinfo"):
+                widget._drain_reset_results()
+        save_mock.assert_called_once_with(None)
+        self.assertIsNone(widget.pending_reset)
+        widget.refresh.assert_called_once_with()
+        widget.root.after.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Requires Windows Tk font metrics")
     def test_fixed_titles_zero_border_labels_and_login_status_action(self):

@@ -15,6 +15,36 @@ from pathlib import Path
 from typing import Any
 
 
+_AUTH_ERROR_MARKERS = (
+    "auth",
+    "401",
+    "unauthor",
+    "login",
+    "sign in",
+    "access token",
+    "refresh token",
+    "id token",
+    "auth token",
+    "invalid_token",
+    "token expired",
+    "expired token",
+    "missing token",
+)
+_EXECUTABLE_CACHE_LOCK = threading.Lock()
+_CACHED_EXECUTABLE: str | None = None
+
+
+def _get_cached_executable() -> str | None:
+    with _EXECUTABLE_CACHE_LOCK:
+        return _CACHED_EXECUTABLE
+
+
+def _set_cached_executable(executable: str | None) -> None:
+    with _EXECUTABLE_CACHE_LOCK:
+        global _CACHED_EXECUTABLE
+        _CACHED_EXECUTABLE = executable
+
+
 class UsageError(RuntimeError):
     """Raised when the local Codex app server cannot return usage data."""
 
@@ -100,9 +130,11 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
     if isinstance(credits, dict):
         unlimited = bool(credits.get("unlimited", False))
         raw_balance = credits.get("balance")
-        if raw_balance is not None:
+        if raw_balance is not None and not isinstance(raw_balance, bool):
             try:
-                balance = Decimal(str(raw_balance))
+                parsed_balance = Decimal(str(raw_balance))
+                if parsed_balance.is_finite():
+                    balance = parsed_balance
             except InvalidOperation:
                 balance = None
 
@@ -158,6 +190,8 @@ class _LineReader:
         try:
             for line in stream:
                 self.lines.put(line)
+        except (OSError, ValueError):
+            pass
         finally:
             self.lines.put(None)
 
@@ -195,7 +229,7 @@ def _wait_for_id(reader: _LineReader, request_id: int, deadline: float) -> dict[
             if isinstance(detail, dict):
                 detail = detail.get("message") or detail
             error_text = str(detail).lower()
-            if any(word in error_text for word in ("auth", "token", "401", "unauthor", "login", "sign in")):
+            if any(word in error_text for word in _AUTH_ERROR_MARKERS):
                 raise AuthRequiredError("Codex 인증을 확인할 수 없습니다. Codex에서 로그인 상태를 확인해 주세요.")
             raise UsageError("Codex App Server가 요청을 처리하지 못했습니다.")
         result = message.get("result")
@@ -352,28 +386,64 @@ def _query_with_executable(executable: str, timeout: float,
     except OSError as exc:
         raise UsageError("Codex App Server와 통신하지 못했습니다.") from exc
     finally:
+        if process.stdin:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
         if process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=1.5)
             except subprocess.TimeoutExpired:
                 process.kill()
-        if process.stdin:
-            process.stdin.close()
+                try:
+                    process.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    pass
+        reader.thread.join(timeout=1.0)
         if process.stdout:
-            process.stdout.close()
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
 
 
 def query_usage(timeout: float = 15.0) -> UsageSnapshot:
     """Fetch a snapshot, falling back across current and newly installed Codex builds."""
     deadline = time.monotonic() + timeout
+    errors: list[str] = []
+    auth_error: str | None = None
+    tried_keys: set[str] = set()
+
+    cached = _get_cached_executable()
+    if cached and Path(cached).is_file():
+        tried_keys.add(os.path.normcase(cached))
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                snapshot = _query_with_executable(cached, remaining)
+                if not isinstance(snapshot, UsageSnapshot):
+                    raise UsageError("Codex 사용량 응답 형식이 올바르지 않습니다.")
+                return replace(snapshot, executable=cached)
+            except AuthRequiredError as exc:
+                auth_error = str(exc)
+                errors.append(auth_error)
+            except UsageError as exc:
+                errors.append(str(exc))
+            _set_cached_executable(None)
+    elif cached is not None:
+        _set_cached_executable(None)
+
     executables = find_codex_executables()
-    if not executables:
+    if not executables and not errors:
         raise UsageError("Codex 실행 파일을 찾을 수 없습니다. Codex Desktop을 실행하거나 설치한 뒤 다시 시도해 주세요.")
 
-    errors: list[str] = []
-    saw_auth_error = False
     for executable in executables:
+        key = os.path.normcase(executable)
+        if key in tried_keys:
+            continue
+        tried_keys.add(key)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -381,15 +451,18 @@ def query_usage(timeout: float = 15.0) -> UsageSnapshot:
             snapshot = _query_with_executable(executable, remaining)
             if not isinstance(snapshot, UsageSnapshot):
                 raise UsageError("Codex 사용량 응답 형식이 올바르지 않습니다.")
+            if Path(executable).is_file():
+                _set_cached_executable(executable)
             return replace(snapshot, executable=executable)
         except AuthRequiredError as exc:
-            saw_auth_error = True
+            if auth_error is None:
+                auth_error = str(exc)
             errors.append(str(exc))
         except UsageError as exc:
             errors.append(str(exc))
 
-    if saw_auth_error:
-        raise AuthRequiredError(errors[-1])
+    if auth_error is not None:
+        raise AuthRequiredError(auth_error)
     detail = errors[-1] if errors else "알 수 없는 오류"
     raise UsageError(f"Codex에 연결하지 못했습니다: {detail}")
 
@@ -399,10 +472,16 @@ def consume_reset_credit(idempotency_key: str, executable: str, credit_id: str,
     """Redeem once; callers retain the same key after an uncertain result."""
     if not all((idempotency_key, executable, credit_id)):
         raise ValueError("리셋권 요청 정보가 누락되었습니다.")
-    if executable not in find_codex_executables():
+    target_key = os.path.normcase(os.path.abspath(executable))
+    matched_executable = next(
+        (candidate for candidate in find_codex_executables()
+         if os.path.normcase(os.path.abspath(candidate)) == target_key),
+        None,
+    )
+    if matched_executable is None:
         raise UsageError("리셋권을 조회한 Codex 실행 파일을 찾을 수 없습니다.")
     # Never fall back or automatically retry a mutation after a transport error.
-    outcome = _query_with_executable(executable, timeout, reset_key=idempotency_key,
+    outcome = _query_with_executable(matched_executable, timeout, reset_key=idempotency_key,
                                      credit_id=credit_id)
     if not isinstance(outcome, str):
         raise UsageError("리셋권 사용 결과 형식이 올바르지 않습니다.")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,8 +46,6 @@ def save_settings(settings: WidgetSettings) -> None:
 def load_pending_reset() -> PendingReset | None:
     path = settings_path().with_name("pending-reset.json")
     try:
-        import json
-
         with path.open("r", encoding="utf-8") as source:
             data = json.load(source)
     except FileNotFoundError:

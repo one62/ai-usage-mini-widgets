@@ -9,7 +9,7 @@ import threading
 import uuid
 import webbrowser
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from tkinter import messagebox
 
@@ -330,8 +330,11 @@ class UsageWidget(BaseUsageWidget):
         plan_text = snapshot.plan if snapshot.plan.lower() != "unknown" else "—"
         if snapshot.unlimited_credits:
             credit_text = "무제한"
-        elif snapshot.credit_balance is not None:
-            credit_text = f"{snapshot.credit_balance.quantize(Decimal('0.01'))}"
+        elif snapshot.credit_balance is not None and snapshot.credit_balance.is_finite():
+            try:
+                credit_text = f"{snapshot.credit_balance.quantize(Decimal('0.01'))}"
+            except InvalidOperation:
+                credit_text = str(snapshot.credit_balance)
         else:
             credit_text = "—"
         self.menu.entryconfigure(
