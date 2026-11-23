@@ -11,7 +11,7 @@ import webbrowser
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import Label, messagebox
 
 _WIDGET_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _WIDGET_DIR.parent
@@ -30,6 +30,7 @@ from codex_settings import (
 from codex_usage import (
     AuthRequiredError,
     ResetAccountUnverifiedError,
+    UsageTimeoutError,
     UsageError,
     UsageSnapshot,
     consume_reset_credit,
@@ -100,6 +101,10 @@ class UsageWidget(BaseUsageWidget):
             week_fg=TEXT,
         )
 
+        self.reset_status = Label(
+            self.header, bg=self.header.cget("bg"), fg=TEXT, font=self.five_title.cget("font")
+        )
+
         self.menu = PopupMenu(self.root, self._menu_closed, reserve_indicator_space=True)
         self.menu.add_command(label="지금 새로고침", command=self.refresh)
         self.menu.add_command(
@@ -113,9 +118,9 @@ class UsageWidget(BaseUsageWidget):
         self.account_index = self.menu.index("end")
         self.menu.add_info(label="요금제: —", right_text="크레딧: —")
         self.plan_index = self.menu.index("end")
-        self.menu.add_info(label="사용량 리셋권: —", right_text="")
+        self.menu.add_info(label="초기화권: —", right_text="")
         self.reset_count_index = self.menu.index("end")
-        self.menu.add_command(label="리셋권 사용하기", state="disabled", command=self._use_reset_credit)
+        self.menu.add_command(label="초기화권 사용", state="disabled", command=self._use_reset_credit)
         self.reset_use_index = self.menu.index("end")
         self.menu.add_separator()
         self._add_common_preference_menu_items(self.menu)
@@ -139,7 +144,7 @@ class UsageWidget(BaseUsageWidget):
         expiry = self._reset_expiry_label(self.snapshot) if count else ""
         self.menu.entryconfigure(
             self.reset_count_index,
-            label=f"사용량 리셋권: {count}개" if count is not None else "사용량 리셋권: 조회 불가",
+            label=f"초기화권 {count}개 사용 가능" if count is not None else "초기화권: 조회 불가",
             right_text=expiry,
         )
         retry = self.pending_reset is not None
@@ -155,13 +160,13 @@ class UsageWidget(BaseUsageWidget):
             and not self.reset_state_unreadable
             and (retry or can_start)
         )
-        label = "리셋권 사용 결과 재확인" if retry else "리셋권 사용하기"
+        label = "사용 결과 확인" if retry else "초기화권 사용"
         if self.resetting:
-            label = "리셋권 사용 처리 중…"
+            label = self.reset_status.cget("text")
         elif self.reset_state_unreadable:
-            label = "리셋권 사용 불가 (요청 기록 확인 필요)"
+            label = "초기화권 사용 불가 (요청 기록 확인 필요)"
         elif count and not retry and not can_start and not self.connection_failed:
-            label = "리셋권 사용 불가 (대상 확인 필요)"
+            label = "초기화권 사용 불가 (대상 확인 필요)"
         self.menu.entryconfigure(
             self.reset_use_index,
             label=label,
@@ -175,7 +180,7 @@ class UsageWidget(BaseUsageWidget):
             return "만료일 없음"
         if expires_at is not None:
             try:
-                return f"~{datetime.fromtimestamp(expires_at):%m.%d.}"
+                return f"{datetime.fromtimestamp(expires_at):%Y.%m.%d.} 만료"
             except (OverflowError, OSError, ValueError):
                 pass
         return "만료일 조회 불가"
@@ -187,7 +192,7 @@ class UsageWidget(BaseUsageWidget):
         snapshot = self.snapshot
         retry = request is not None
         if retry:
-            prompt = "이전 리셋권 사용 요청의 결과를 같은 요청 키로 다시 확인합니다.\n계속하시겠습니까?"
+            prompt = "이전 요청에서 초기화권이 사용됐는지 확인할까요?\n초기화권을 추가로 사용하지 않습니다."
         else:
             if (
                 self.connection_failed
@@ -199,16 +204,16 @@ class UsageWidget(BaseUsageWidget):
             request = PendingReset(
                 str(uuid.uuid4()), snapshot.executable, snapshot.reset_credit_id, snapshot.account_id
             )
-            selection = (
-                "조회된 상세 목록에서 만료일이 가장 빠른 권리를 선택했습니다."
-                if snapshot.reset_credit_details_limited
-                else "만료가 있는 권리부터 사용합니다."
-            )
+            expiry = self._reset_expiry_label(snapshot)
             prompt = (
-                f"사용량 리셋권 1개를 사용하시겠습니까? ({self._reset_expiry_label(snapshot)})\n"
-                f"{selection}\n\n초기화 대상 기간은 서버가 결정하며, 주간 사용량만 지정할 수는 없습니다."
+                "초기화권 1개를 사용해 Codex 사용량을 초기화할까요?\n"
+                "이 초기화권이 적용되는 사용 한도만 초기화됩니다.\n\n"
+                f"사용할 초기화권 · {expiry}"
             )
-        if not messagebox.askyesno("사용량 리셋권", prompt, parent=self.root):
+            if snapshot.reset_credit_details_limited:
+                prompt += "\n확인할 수 있는 초기화권 중에서 선택했습니다."
+        title = "사용 결과 확인" if retry else "사용량 초기화"
+        if not messagebox.askyesno(title, prompt, parent=self.root):
             self._ensure_topmost()
             return
         self._ensure_topmost()
@@ -216,7 +221,7 @@ class UsageWidget(BaseUsageWidget):
         if self._closing:
             return
         if self.resetting or self.refreshing:
-            messagebox.showinfo("사용량 리셋권", "조회가 끝난 뒤 다시 선택해 주세요.", parent=self.root)
+            messagebox.showinfo("사용량 초기화", "조회가 끝난 뒤 다시 선택해 주세요.", parent=self.root)
             self._ensure_topmost()
             return
         if not retry and (
@@ -227,13 +232,16 @@ class UsageWidget(BaseUsageWidget):
             try:
                 save_pending_reset(request)
             except OSError:
-                messagebox.showwarning("사용량 리셋권", "요청 기록을 저장하지 못했습니다.", parent=self.root)
+                messagebox.showwarning("사용량 초기화", "요청을 저장하지 못해 초기화를 시작할 수 없습니다. 잠시 후 다시 시도하세요.", parent=self.root)
                 self._ensure_topmost()
                 return
             self.pending_reset = request
         elif self.pending_reset != request:
             return
         self.resetting = True
+        self.reset_status.configure(text="사용 결과 확인 중…" if retry else "사용량 초기화 중…")
+        self.reset_status.place(x=0, y=0, relwidth=1, relheight=1)
+        self.reset_status.lift()
         self.menu.entryconfigure(0, state="disabled")
         self._update_reset_menu()
         threading.Thread(target=self._reset_worker, args=(request,), daemon=True).start()
@@ -265,6 +273,7 @@ class UsageWidget(BaseUsageWidget):
                 self._reset_drain_after_id = self.root.after(100, self._drain_reset_results)
             return
         self.resetting = False
+        self.reset_status.place_forget()
         self.menu.entryconfigure(0, state="normal")
         if kind == "ok":
             try:
@@ -274,15 +283,15 @@ class UsageWidget(BaseUsageWidget):
             else:
                 self.pending_reset = None
             messages = {
-                "reset": "리셋권 1개를 사용했습니다. 사용량과 남은 개수를 다시 조회합니다.",
-                "alreadyRedeemed": "이 요청은 이미 처리되었습니다. 사용량과 남은 개수를 다시 조회합니다.",
-                "nothingToReset": "현재 초기화할 수 있는 사용량 기간이 없습니다.",
-                "noCredit": "사용 가능한 리셋권이 없습니다.",
+                "reset": "초기화권 1개를 사용했습니다. 사용량에 반영되기까지 잠시 걸릴 수 있습니다.",
+                "alreadyRedeemed": "앞선 요청에서 이미 초기화권을 사용했습니다.",
+                "nothingToReset": "지금은 사용량을 초기화할 필요가 없습니다. 초기화권은 다음에 사용할 수 있습니다.",
+                "noCredit": "사용할 수 있는 초기화권이 없습니다.",
             }
             self.refresh()
             messagebox.showinfo(
-                "사용량 리셋권",
-                messages.get(str(payload), "리셋권 처리가 완료되었습니다."),
+                "사용량 초기화",
+                messages.get(str(payload), "초기화권 사용 요청을 처리했습니다."),
                 parent=self.root,
             )
             self._ensure_topmost()
@@ -291,12 +300,14 @@ class UsageWidget(BaseUsageWidget):
             if isinstance(payload, ResetAccountUnverifiedError):
                 self._offer_archive_pending_reset(str(payload))
             else:
-                detail = f"\n\n{payload}" if isinstance(payload, UsageError) else ""
+                reason = "초기화권 사용 여부를 확인하지 못했습니다."
+                if isinstance(payload, UsageTimeoutError):
+                    reason = "응답이 늦어 초기화권 사용 여부를 확인하지 못했습니다."
+                elif isinstance(payload, UsageError):
+                    reason = str(payload) or reason
                 messagebox.showwarning(
-                    "사용량 리셋권",
-                    "리셋권 사용 결과를 확인하지 못했습니다.\n\n"
-                    "‘리셋권 사용 결과 재확인’에서 같은 리셋권과 요청 키로 확인할 수 있습니다."
-                    f"{detail}",
+                    "사용 결과 확인",
+                    f"{reason}\n\n메뉴에서 ‘사용 결과 확인’을 선택하세요.",
                     parent=self.root,
                 )
             self._ensure_topmost()
@@ -304,7 +315,7 @@ class UsageWidget(BaseUsageWidget):
     def _offer_archive_pending_reset(self, detail: str) -> None:
         request = self.pending_reset
         if request is None or not messagebox.askyesno(
-            "리셋권 요청 기록 보관",
+            "초기화권 요청 기록 보관",
             f"{detail}\n\n원래 Codex 계정에서 처리 결과를 직접 확인한 경우, "
             "이전 기록을 보관하고 새 요청을 허용하시겠습니까?",
             parent=self.root,
@@ -315,7 +326,7 @@ class UsageWidget(BaseUsageWidget):
         try:
             archive_pending_reset(request)
         except (OSError, ValueError, RecursionError):
-            messagebox.showwarning("사용량 리셋권", "요청 기록을 보관하지 못했습니다.", parent=self.root)
+            messagebox.showwarning("사용량 초기화", "요청 기록을 보관하지 못했습니다.", parent=self.root)
         else:
             self.pending_reset = None
             self._update_reset_menu()

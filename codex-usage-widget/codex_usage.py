@@ -53,6 +53,10 @@ class AuthRequiredError(UsageError):
     """Raised when Codex authentication is missing or expired."""
 
 
+class UsageTimeoutError(UsageError):
+    """Codex did not respond before the deadline."""
+
+
 class ResetAccountUnverifiedError(UsageError):
     """The account that owns the pending reset cannot be verified."""
 
@@ -211,7 +215,7 @@ class _LineReader:
         try:
             line = self.lines.get(timeout=timeout)
         except queue.Empty as exc:
-            raise UsageError("Codex 응답 대기 시간이 초과되었습니다.") from exc
+            raise UsageTimeoutError("Codex 응답 대기 시간이 초과되었습니다.") from exc
         if line is None:
             raise UsageError("Codex App Server 연결이 종료되었습니다.")
         return line
@@ -228,7 +232,7 @@ def _wait_for_id(reader: _LineReader, request_id: int, deadline: float) -> dict[
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise UsageError("Codex 응답 대기 시간이 초과되었습니다.")
+            raise UsageTimeoutError("Codex 응답 대기 시간이 초과되었습니다.")
         raw = reader.get(remaining)
         try:
             message = json.loads(raw)
@@ -359,7 +363,7 @@ def _query_with_executable(executable: str, timeout: float,
                     raise UsageError("원래 요청을 보낸 Codex 계정으로 로그인한 뒤 다시 시도해 주세요.")
                 request_id += 1
             if time.monotonic() >= deadline:
-                raise UsageError("리셋권 요청 시간이 초과되었습니다.")
+                raise UsageTimeoutError("초기화권 요청 시간이 초과되었습니다.")
             _send(process, {
                 "id": request_id,
                 "method": "account/rateLimitResetCredit/consume",
@@ -368,7 +372,7 @@ def _query_with_executable(executable: str, timeout: float,
             result = _wait_for_id(reader, request_id, deadline)
             outcome = result.get("outcome")
             if outcome not in ("reset", "alreadyRedeemed", "nothingToReset", "noCredit"):
-                raise UsageError("리셋권 사용 결과를 확인할 수 없습니다. 같은 요청으로 다시 확인해 주세요.")
+                raise UsageError("초기화권 사용 여부를 확인하지 못했습니다.")
             return outcome
         _send(process, {"id": 2, "method": "account/rateLimits/read"})
         try:
@@ -494,7 +498,7 @@ def consume_reset_credit(idempotency_key: str, executable: str, credit_id: str,
                          timeout: float = 18.0, *, account_id: str | None = None) -> str:
     """Redeem once; callers retain the same key after an uncertain result."""
     if not all((idempotency_key, executable, credit_id)):
-        raise ValueError("리셋권 요청 정보가 누락되었습니다.")
+        raise ValueError("초기화권 요청 정보가 누락되었습니다.")
     executables = find_codex_executables()
     target_key = os.path.normcase(os.path.abspath(executable))
     matched_executable = next(
@@ -515,5 +519,5 @@ def consume_reset_credit(idempotency_key: str, executable: str, credit_id: str,
         expected_account_id=account_id,
     )
     if not isinstance(outcome, str):
-        raise UsageError("리셋권 사용 결과 형식이 올바르지 않습니다.")
+        raise UsageError("초기화권 사용 결과 형식이 올바르지 않습니다.")
     return outcome

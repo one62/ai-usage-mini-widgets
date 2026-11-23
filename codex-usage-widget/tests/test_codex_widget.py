@@ -206,11 +206,11 @@ class ParseRateLimitsTests(unittest.TestCase):
         widget._ensure_topmost = mock.Mock()
 
         widget._update_reset_menu()
-        widget.menu.entryconfigure.assert_called_with(2, label="리셋권 사용하기", state="normal")
+        widget.menu.entryconfigure.assert_called_with(2, label="초기화권 사용", state="normal")
         with mock.patch.object(codex_widget.messagebox, "askyesno", return_value=False) as ask:
             widget._use_reset_credit()
         self.assertIn("만료일 없음", ask.call_args.args[1])
-        self.assertIn("조회된 상세 목록", ask.call_args.args[1])
+        self.assertIn("확인할 수 있는 초기화권", ask.call_args.args[1])
         self.assertEqual(snapshot.account_id, "account-1")
 
     def test_token_limit_error_is_not_misclassified_as_auth_and_auth_message_preserved(self):
@@ -268,6 +268,7 @@ class ParseRateLimitsTests(unittest.TestCase):
         widget = UsageWidget.__new__(UsageWidget)
         widget.root = mock.Mock()
         widget.menu = mock.Mock()
+        widget.reset_status = mock.Mock()
         widget.reset_results = queue.Queue()
         widget.resetting = True
         widget._closing = False
