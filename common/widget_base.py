@@ -304,14 +304,18 @@ class BaseUsageWidget:
     def _render_connection_issue(self) -> None:
         if not getattr(self, "connection_failed", False) and not getattr(self, "last_error", ""):
             return
+        label = self._connection_issue_label()
         if (
             self.snapshot is not None
             and self.failure_count < 3
             and not getattr(self, "auth_required", False)
         ):
-            self.reset_compact.configure(text="retry", fg=YELLOW)
+            label.configure(text="retry", fg=YELLOW)
         else:
-            self.reset_compact.configure(text="offline", fg=MUTED)
+            label.configure(text="offline", fg=MUTED)
+
+    def _connection_issue_label(self) -> tk.Label:
+        return self.reset_compact
 
     def _on_connection_status_click(self) -> None:
         if getattr(self, "auth_required", False):
@@ -366,20 +370,14 @@ class BaseUsageWidget:
             if fixed_fg is None and title_label is not None:
                 title_label.configure(fg=fg)
             value_label.configure(text=f"{used_percent}%", fg=fg)
-            if weekly:
-                reset_label.configure(text=reset_short(resets_at, weekly=True))
-            else:
-                reset_label.configure(text=reset_short(resets_at), fg=MUTED)
+            reset_label.configure(text=reset_short(resets_at, weekly=weekly), fg=MUTED)
             self.root.after_idle(lambda p=used_percent, m=meter: self._draw_segments(m, p))
         else:
             fg = fixed_fg if fixed_fg is not None else TEXT
             if fixed_fg is None and title_label is not None:
                 title_label.configure(fg=fg)
             value_label.configure(text="—%", fg=fg)
-            if weekly:
-                reset_label.configure(text=reset_short(None, weekly=True))
-            else:
-                reset_label.configure(text="—", fg=MUTED)
+            reset_label.configure(text="—", fg=MUTED)
             self._draw_segments(meter, None)
 
     def _build_header_shell(
@@ -407,6 +405,7 @@ class BaseUsageWidget:
         reset_font = tkfont.Font(self.root, family=FONT_FAMILY, size=9)
 
         def add_right_aligned_label(
+            parent: tk.Frame,
             text: str,
             max_text: str,
             color: str,
@@ -414,7 +413,7 @@ class BaseUsageWidget:
             padx: tuple[int, int] = (0, 0),
         ) -> tk.Label:
             # Measure with Tk's active font metrics, which already reflect DPI scaling.
-            column = tk.Frame(header, width=font.measure(max_text), height=18, bg=BG)
+            column = tk.Frame(parent, width=font.measure(max_text), height=18, bg=BG)
             column.pack_propagate(False)
             label = tk.Label(
                 column,
@@ -433,6 +432,7 @@ class BaseUsageWidget:
             return label
 
         def add_metric_labels(
+            parent: tk.Frame,
             title: str,
             value: str,
             max_text: str,
@@ -440,7 +440,7 @@ class BaseUsageWidget:
             font: tkfont.Font,
             padx: tuple[int, int] = (1, 0),
         ) -> tuple[tk.Label, tk.Label]:
-            column = tk.Frame(header, width=font.measure(max_text), height=18, bg=BG)
+            column = tk.Frame(parent, width=font.measure(max_text), height=18, bg=BG)
             column.pack_propagate(False)
             title_label = tk.Label(
                 column,
@@ -471,16 +471,22 @@ class BaseUsageWidget:
             column.pack(side="left", padx=padx)
             return title_label, value_label
 
+        self.five_section = tk.Frame(header, bg=BG)
+        self.five_section.pack(side="left")
         self.five_title, self.five_label = add_metric_labels(
+            self.five_section,
             "5H",
             "—%",
             "5H 100%",
             five_fg,
             percent_font,
         )
-        self.five_meter = tk.Canvas(header, width=23, height=10, bg=BG, bd=0, highlightthickness=0)
+        self.five_meter = tk.Canvas(
+            self.five_section, width=23, height=10, bg=BG, bd=0, highlightthickness=0
+        )
         self.five_meter.pack(side="left", padx=(3, 5))
         self.reset_compact = add_right_aligned_label(
+            self.five_section,
             "—",
             "5h 59m",
             MUTED,
@@ -488,9 +494,10 @@ class BaseUsageWidget:
             padx=(0, 8),
         )
 
-        tk.Frame(header, bg="#56525F", width=1, height=18).pack(side="left", padx=(0, 5))
+        tk.Frame(self.five_section, bg="#56525F", width=1, height=18).pack(side="left", padx=(0, 5))
 
         self.week_title, self.week_label = add_metric_labels(
+            header,
             "WK",
             "—%",
             "WK 100%",
@@ -500,6 +507,7 @@ class BaseUsageWidget:
         self.week_meter = tk.Canvas(header, width=23, height=10, bg=BG, bd=0, highlightthickness=0)
         self.week_meter.pack(side="left", padx=(3, 5))
         self.week_reset = add_right_aligned_label(
+            header,
             "—",
             "7d 23h",
             MUTED,
@@ -530,12 +538,12 @@ class BaseUsageWidget:
             command=self._toggle_autostart,
         )
 
-    def _fit_content_width(self) -> None:
+    def _fit_content_width(self, *, min_width: int = WINDOW_WIDTH) -> None:
         """Fit the window to fixed pixel columns measured at the current DPI."""
         self.root.update_idletasks()
         # Label columns have fixed pixel widths, so content changes cannot resize it.
         # Tk font metrics are DPI-aware because awareness is enabled before Tk starts.
-        width = max(WINDOW_WIDTH, self.header.winfo_reqwidth() + 16)
+        width = max(min_width, self.header.winfo_reqwidth() + 16)
         x, y = self.root.winfo_x(), self.root.winfo_y()
         area = monitor_work_area(x, y, width, WINDOW_HEIGHT)
         x, y = clamp_position(x, y, width, WINDOW_HEIGHT, area)

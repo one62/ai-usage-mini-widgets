@@ -332,38 +332,53 @@ class UsageWidget(BaseUsageWidget):
             self._update_reset_menu()
             self.refresh()
 
+    def _connection_issue_label(self) -> Label:
+        return self.reset_compact if self.five_section.winfo_manager() else self.week_reset
+
+    def _set_five_hour_visible(self, visible: bool) -> None:
+        if visible == bool(self.five_section.winfo_manager()):
+            return
+        if visible:
+            self.five_section.pack(side="left", before=self.week_title.master)
+            self._fit_content_width()
+        else:
+            self.five_section.pack_forget()
+            self._fit_content_width(min_width=0)
+
     def _update_time_labels(self) -> None:
         snapshot = self.snapshot
         if snapshot is None:
             return
-        primary = snapshot.primary
+        five_hour, weekly = snapshot.metric_windows
         self.reset_compact.configure(
-            text=reset_short(primary.resets_at) if primary else "—",
+            text=reset_short(five_hour.resets_at if five_hour else None),
             fg=MUTED,
         )
-        secondary = snapshot.secondary
         self.week_reset.configure(
-            text=reset_short(secondary.resets_at if secondary else None, weekly=True)
+            text=reset_short(weekly.resets_at if weekly else None, weekly=True),
+            fg=MUTED,
         )
 
     def _render(self, snapshot: UsageSnapshot) -> None:
-        primary = snapshot.primary
+        five_hour, weekly = snapshot.metric_windows
+        five_hour_visible = snapshot.has_five_hour_limit
+        if five_hour_visible is not None:
+            self._set_five_hour_visible(five_hour_visible)
         self._render_metric_window(
             title_label=self.five_title,
             value_label=self.five_label,
             reset_label=self.reset_compact,
             meter=self.five_meter,
-            used_percent=primary.used_percent if primary else None,
-            resets_at=primary.resets_at if primary else None,
+            used_percent=five_hour.used_percent if five_hour else None,
+            resets_at=five_hour.resets_at if five_hour else None,
         )
-        secondary = snapshot.secondary
         self._render_metric_window(
             title_label=self.week_title,
             value_label=self.week_label,
             reset_label=self.week_reset,
             meter=self.week_meter,
-            used_percent=secondary.used_percent if secondary else None,
-            resets_at=secondary.resets_at if secondary else None,
+            used_percent=weekly.used_percent if weekly else None,
+            resets_at=weekly.resets_at if weekly else None,
             weekly=True,
         )
 

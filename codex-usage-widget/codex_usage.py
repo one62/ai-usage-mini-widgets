@@ -32,6 +32,8 @@ _AUTH_ERROR_MARKERS = (
 )
 _EXECUTABLE_CACHE_LOCK = threading.Lock()
 _CACHED_EXECUTABLE: str | None = None
+_FIVE_HOUR_MINUTES = 5 * 60
+_WEEK_MINUTES = 7 * 24 * 60
 
 
 def _get_cached_executable() -> str | None:
@@ -86,6 +88,35 @@ class UsageSnapshot:
     executable: str | None = None
     account_id: str | None = None
     reset_credit_details_limited: bool = False
+    has_unparsed_window: bool = False
+
+    @property
+    def metric_windows(self) -> tuple[UsageWindow | None, UsageWindow | None]:
+        # Prefer explicit durations, then use the old slot order for durationless windows.
+        by_duration = {
+            window.duration_minutes: window
+            for window in (self.secondary, self.primary)
+            if window is not None and window.duration_minutes is not None
+        }
+        five_hour = by_duration.get(_FIVE_HOUR_MINUTES)
+        if five_hour is None and self.primary is not None and self.primary.duration_minutes is None:
+            five_hour = self.primary
+        weekly = by_duration.get(_WEEK_MINUTES)
+        if weekly is None and self.secondary is not None and self.secondary.duration_minutes is None:
+            weekly = self.secondary
+        return five_hour, weekly
+
+    @property
+    def has_five_hour_limit(self) -> bool | None:
+        """Return None when the response cannot determine five-hour visibility."""
+        durations = {
+            window.duration_minutes for window in (self.primary, self.secondary) if window is not None
+        }
+        if _FIVE_HOUR_MINUTES in durations:
+            return True
+        if durations == {_WEEK_MINUTES} and not self.has_unparsed_window:
+            return False
+        return None
 
 
 def _window(value: Any) -> UsageWindow | None:
@@ -186,6 +217,10 @@ def parse_rate_limits(result: dict[str, Any]) -> UsageSnapshot:
         plan=str(rate_limits.get("planType") or result.get("planType") or "unknown"),
         primary=primary,
         secondary=secondary,
+        has_unparsed_window=(
+            (rate_limits.get("primary") is not None and primary is None)
+            or (rate_limits.get("secondary") is not None and secondary is None)
+        ),
         credit_balance=balance,
         unlimited_credits=unlimited,
         reset_credit_count=reset_credit_count,
