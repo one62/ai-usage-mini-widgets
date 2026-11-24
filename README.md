@@ -2,13 +2,22 @@
 
 Codex(ChatGPT)와 Gemini(Antigravity) 사용량을 바탕화면에 작게 띄워 확인하는 Windows 미니 위젯 모음입니다.
 
+## Windows 실행 파일
+
+[GitHub Releases](https://github.com/one62/ai-usage-mini-widgets/releases)의 **Assets**에서 필요한 Windows x64 실행 파일을 다운로드하세요. Python은 실행 파일에 포함되어 있습니다.
+
+- `CodexUsageWidget.exe` — 로그인된 Codex 데스크톱 앱 또는 CLI 필요
+- `GeminiUsageWidget.exe` — 로그인 후 실행 중인 Antigravity 필요
+
+자동 실행을 사용하려면 파일을 계속 둘 폴더로 옮긴 뒤, 위젯 우클릭 메뉴에서 **Windows 시작 시 자동 실행**을 켜세요. 업데이트할 때는 위젯을 종료하고 같은 위치에 같은 이름으로 새 파일을 덮어쓰면 자동 실행과 위젯 설정이 유지됩니다. 파일을 옮긴 경우 새 위치에서 위젯을 열고 자동 실행을 다시 켜세요. 파일을 삭제하기 전에는 자동 실행을 꺼서 등록을 지울 수 있습니다.
+
 ## 폴더 구성
 
 - `common/`: 두 위젯이 함께 사용하는 설정 저장(`settings.py`), 색상·시간 포맷(`formatting.py`), Win32 유틸(`win32.py`), 우클릭 메뉴(`popup_menu.py`), 공통 베이스 위젯(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
 - `codex-usage-widget/`: Codex 사용량 미니 위젯 ([상세 안내](codex-usage-widget/README.md))
 - `gemini-usage-widget/`: Gemini / Antigravity 사용량 미니 위젯 ([상세 안내](gemini-usage-widget/README.md))
 
-## 실행 및 재시작
+## 소스에서 실행 및 재시작
 
 루트 폴더의 배치 파일을 실행하면 해당 위젯을 실행합니다. 이미 같은 위젯이 실행 중이면 기존 프로세스를 종료한 뒤 다시 시작합니다.
 

@@ -130,7 +130,10 @@ def monitor_work_area(x: int, y: int, width: int, height: int) -> tuple[int, int
 
 
 def pythonw_command_for(script_path: Path) -> str:
+    """Return the logon command for a packaged executable or a source script."""
     interpreter = Path(sys.executable)
+    if getattr(sys, "frozen", False):
+        return f'"{interpreter}"'
     pythonw = interpreter.with_name("pythonw.exe")
     selected = pythonw if pythonw.exists() else interpreter
     return f'"{selected}" "{script_path.resolve()}"'
@@ -141,7 +144,7 @@ def autostart_enabled_for(run_value: str, script_path: Path) -> bool:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             value, _ = winreg.QueryValueEx(key, run_value)
             return value == pythonw_command_for(script_path)
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         return False
 
 

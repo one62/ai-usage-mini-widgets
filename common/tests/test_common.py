@@ -15,6 +15,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from common import win32
 from common.settings import (
     WidgetSettings,
     app_settings_path,
@@ -36,6 +37,47 @@ from common.widget_base import (
 
 
 class CommonHelpersTests(unittest.TestCase):
+    def test_source_autostart_uses_pythonw_and_script_path(self):
+        interpreter = Path(r"C:\Program Files\Python\python.exe")
+        script = Path(r"C:\Widget Source\widget.py")
+        with (
+            mock.patch.object(win32.sys, "frozen", False, create=True),
+            mock.patch.object(win32.sys, "executable", str(interpreter)),
+            mock.patch.object(Path, "exists", return_value=True),
+        ):
+            self.assertEqual(
+                win32.pythonw_command_for(script),
+                f'"{interpreter.with_name("pythonw.exe")}" "{script}"',
+            )
+
+    def test_packaged_autostart_registers_only_the_installed_executable(self):
+        executable = Path(r"C:\My Widgets\CodexUsageWidget.exe")
+        extracted_script = Path(r"C:\Temp\_MEI12345\widget.py")
+        run_value = "ChatGPTUsageWidget"
+        command = f'"{executable}"'
+        with (
+            mock.patch.object(win32.sys, "frozen", True, create=True),
+            mock.patch.object(win32.sys, "executable", str(executable)),
+            mock.patch.object(win32.winreg, "CreateKey") as create_key,
+            mock.patch.object(win32.winreg, "SetValueEx") as set_value,
+            mock.patch.object(win32.winreg, "OpenKey"),
+            mock.patch.object(win32.winreg, "QueryValueEx", return_value=(command, win32.winreg.REG_SZ)),
+        ):
+            win32.set_autostart_for(run_value, extracted_script, True)
+            set_value.assert_called_once_with(
+                create_key.return_value.__enter__.return_value,
+                run_value,
+                0,
+                win32.winreg.REG_SZ,
+                command,
+            )
+            self.assertTrue(win32.autostart_enabled_for(run_value, extracted_script))
+
+    def test_autostart_status_defaults_to_off_when_registry_access_is_denied(self):
+        script = Path(r"C:\Widget Source\widget.py")
+        with mock.patch.object(win32.winreg, "OpenKey", side_effect=PermissionError):
+            self.assertFalse(win32.autostart_enabled_for("ChatGPTUsageWidget", script))
+
     def test_usage_gradient_has_expected_endpoints(self):
         self.assertEqual(gradient_color(0), "#A5E9C1")
         self.assertEqual(gradient_color(1), "#F6AEAE")
