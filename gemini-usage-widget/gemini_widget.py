@@ -16,6 +16,7 @@ for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
 from common.widget_base import (
     MUTED,
     PopupMenu,
+    TEXT,
     BaseUsageWidget,
     reset_short,
     run_single_instance,
@@ -24,8 +25,6 @@ from gemini_settings import load_settings, save_settings
 from gemini_usage import AuthRequiredError, UsageSnapshot, find_antigravity_executables, query_usage
 
 
-FIVE_HOUR_TEXT = "#A5E9C1"
-WEEK_TEXT = "#D2B8FF"
 RUN_VALUE = "GeminiUsageWidget"
 
 
@@ -57,8 +56,8 @@ class UsageWidget(BaseUsageWidget):
         logo_path = Path(__file__).resolve().parent / "assets" / "gemini-logo.png"
         self._build_header_shell(
             logo_path=logo_path,
-            five_fg=FIVE_HOUR_TEXT,
-            week_fg=WEEK_TEXT,
+            five_fg=TEXT,
+            week_fg=TEXT,
         )
 
         self.menu = PopupMenu(self.root, self._menu_closed, reserve_indicator_space=True)
@@ -82,7 +81,7 @@ class UsageWidget(BaseUsageWidget):
         self._add_common_preference_menu_items(self.menu)
         self.menu.add_separator()
         self.menu.add_command(label="Antigravity 열기", command=self._open_antigravity)
-        self.menu.add_command(label="종료", command=self._close)
+        self.menu.add_command(label="종료", command=self._exit_by_user)
         self._fit_content_width()
 
     def _open_antigravity(self) -> None:
@@ -134,22 +133,22 @@ class UsageWidget(BaseUsageWidget):
     def _render(self, snapshot: UsageSnapshot) -> None:
         five = snapshot.five_hour
         self._render_metric_window(
+            title_label=self.five_title,
             value_label=self.five_label,
             reset_label=self.reset_compact,
             meter=self.five_meter,
             used_percent=five.used_percent if five else None,
             resets_at=five.resets_at if five else None,
-            fixed_fg=FIVE_HOUR_TEXT,
         )
         week = snapshot.seven_day
         self._render_metric_window(
+            title_label=self.week_title,
             value_label=self.week_label,
             reset_label=self.week_reset,
             meter=self.week_meter,
             used_percent=week.used_percent if week else None,
             resets_at=week.resets_at if week else None,
             weekly=True,
-            fixed_fg=WEEK_TEXT,
         )
 
         account_text = snapshot.account_email or "—"

@@ -48,8 +48,8 @@ class PopupMenu:
         self.window.bind("<space>", self._activate_selected)
         self.window.bind("<Left>", lambda event: self._adjust_scale(-1))
         self.window.bind("<Right>", lambda event: self._adjust_scale(1))
-        self.window.bind("<Home>", lambda event: self._adjust_scale(endpoint=0))
-        self.window.bind("<End>", lambda event: self._adjust_scale(endpoint=100))
+        self.window.bind("<Home>", lambda event: self._adjust_scale(endpoint="min"))
+        self.window.bind("<End>", lambda event: self._adjust_scale(endpoint="max"))
         self.window.bind("<FocusOut>", self._focus_out)
 
     def _add_row(
@@ -134,8 +134,20 @@ class PopupMenu:
     def add_checkbutton(self, *, label: str, variable: tk.BooleanVar, command) -> None:
         self._add_row("check", label, command=command, variable=variable)
 
-    def add_scale(self, *, label: str, variable: tk.IntVar, command) -> None:
+    def add_scale(
+        self,
+        *,
+        label: str,
+        variable: tk.IntVar,
+        command,
+        from_: int = 0,
+        to: int = 100,
+        resolution: int = 1,
+        format_value: Callable[[int], str] | None = None,
+        max_value_text: str = "100%",
+    ) -> None:
         index = len(self.entries)
+        formatter = format_value or (lambda value: f"{value}%")
         row = tk.Frame(self.body, bg=self.background)
         row.pack(fill="x", padx=12, pady=4)
         caption = tk.Frame(row, bg=self.background)
@@ -153,14 +165,14 @@ class PopupMenu:
         value_box = tk.Frame(
             caption,
             bg=self.background,
-            width=font.measure("100%") + 4,
+            width=font.measure(max_value_text) + 4,
             height=font.metrics("linespace") + 4,
         )
         value_box.pack(side="right")
         value_box.pack_propagate(False)
         value_widget = tk.Label(
             value_box,
-            text=f"{variable.get()}%",
+            text=formatter(variable.get()),
             anchor="e",
             bg=self.background,
             fg=TEXT,
@@ -169,9 +181,9 @@ class PopupMenu:
         value_widget.pack(fill="both", expand=True)
         scale = tk.Scale(
             row,
-            from_=0,
-            to=100,
-            resolution=1,
+            from_=from_,
+            to=to,
+            resolution=resolution,
             orient="horizontal",
             variable=variable,
             showvalue=False,
@@ -199,6 +211,10 @@ class PopupMenu:
                 value_widget=value_widget,
                 scale=scale,
                 font=font,
+                from_=from_,
+                to=to,
+                resolution=resolution,
+                format_value=formatter,
             )
         )
         for target in (row, caption, text_widget, value_widget, scale):
@@ -210,24 +226,40 @@ class PopupMenu:
         scale.bind("<Down>", lambda event: self._navigate(1))
         scale.bind("<Left>", lambda event: self._adjust_scale(-1))
         scale.bind("<Right>", lambda event: self._adjust_scale(1))
-        scale.bind("<Home>", lambda event: self._adjust_scale(endpoint=0))
-        scale.bind("<End>", lambda event: self._adjust_scale(endpoint=100))
+        scale.bind("<Home>", lambda event: self._adjust_scale(endpoint="min"))
+        scale.bind("<End>", lambda event: self._adjust_scale(endpoint="max"))
         scale.bind("<Return>", self._activate_selected)
         scale.bind("<space>", self._activate_selected)
 
     def _scale_changed(self, index: int, value: str) -> None:
         entry = self.entries[index]
-        number = max(0, min(100, round(float(value))))
+        from_ = entry["from_"]
+        to = entry["to"]
+        resolution = max(1, entry["resolution"])
+        number = round(float(value))
+        if resolution > 1:
+            number = from_ + round((number - from_) / resolution) * resolution
+        number = max(from_, min(to, number))
         # Keep the track fixed while dragging, including 9 -> 10 -> 100%.
-        entry["value_widget"].configure(text=f"{number}%")
+        entry["value_widget"].configure(text=entry["format_value"](number))
         entry["command"](number)
 
-    def _adjust_scale(self, delta: int = 0, *, endpoint: int | None = None) -> str:
+    def _adjust_scale(self, delta: int = 0, *, endpoint: str | int | None = None) -> str:
         if self.selected is not None:
             entry = self.entries[self.selected]
             if entry["kind"] == "scale":
-                value = endpoint if endpoint is not None else entry["variable"].get() + delta
-                entry["scale"].set(max(0, min(100, value)))
+                from_ = entry["from_"]
+                to = entry["to"]
+                resolution = max(1, entry["resolution"])
+                if endpoint == "min":
+                    value = from_
+                elif endpoint == "max":
+                    value = to
+                elif isinstance(endpoint, int):
+                    value = endpoint
+                else:
+                    value = entry["variable"].get() + (delta * resolution)
+                entry["scale"].set(max(from_, min(to, value)))
         return "break"
 
     def add_separator(self) -> None:
@@ -258,6 +290,7 @@ class PopupMenu:
             return
         if entry["kind"] == "scale":
             entry["text_widget"].configure(fg=TEXT if self.selected == index else MUTED)
+            entry["value_widget"].configure(text=entry["format_value"](entry["variable"].get()))
             return
         enabled = self._enabled(index)
         foreground = TEXT if enabled else MUTED

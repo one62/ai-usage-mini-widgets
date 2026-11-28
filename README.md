@@ -8,14 +8,16 @@ Codex(ChatGPT)와 Gemini(Antigravity) 사용량을 바탕화면에 작게 띄워
 
 - `CodexUsageWidget.exe` — 로그인된 Codex 데스크톱 앱 또는 CLI 필요
 - `GeminiUsageWidget.exe` — 로그인 후 실행 중인 Antigravity 필요
+- `AIUsageWidget.exe` — Codex와 Gemini를 한 창에서 전환하며 확인하는 통합 위젯 ([상세 안내](ai-usage-widget/README.md))
 
-자동 실행을 사용하려면 파일을 계속 둘 폴더로 옮긴 뒤, 위젯 우클릭 메뉴에서 **Windows 시작 시 자동 실행**을 켜세요. 업데이트할 때는 위젯을 종료하고 같은 위치에 같은 이름으로 새 파일을 덮어쓰면 자동 실행과 위젯 설정이 유지됩니다. 파일을 옮긴 경우 새 위치에서 위젯을 열고 자동 실행을 다시 켜세요. 파일을 삭제하기 전에는 자동 실행을 꺼서 등록을 지울 수 있습니다.
+자동 실행을 사용하려면 파일을 계속 둘 폴더로 옮긴 뒤, 위젯 우클릭 메뉴에서 **Windows 시작 시 자동 실행**을 켜세요. PC 종료·재부팅 등으로 위젯이 닫힐 때는 자동 실행이 유지되지만, 우클릭 메뉴에서 **종료**를 눌러 직접 종료하면 **Windows 시작 시 자동 실행도 함께 해제**됩니다. 업데이트하거나 파일을 옮긴 뒤에는 새 실행 파일에서 위젯을 열고 자동 실행을 다시 켜세요. 위젯 설정(위치·투명도 등)은 그대로 유지됩니다.
 
 ## 폴더 구성
 
-- `common/`: 두 위젯이 함께 사용하는 설정 저장(`settings.py`), 색상·시간 포맷(`formatting.py`), Win32 유틸(`win32.py`), 우클릭 메뉴(`popup_menu.py`), 공통 베이스 위젯(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
+- `common/`: 세 위젯이 함께 사용하는 설정 저장(`settings.py`), 색상·시간 포맷(`formatting.py`), Win32 유틸(`win32.py`), 우클릭 메뉴(`popup_menu.py`), 공통 베이스 위젯(`widget_base.py`), 넥슨 풋볼고딕 폰트(`assets/fonts/`)
 - `codex-usage-widget/`: Codex 사용량 미니 위젯 ([상세 안내](codex-usage-widget/README.md))
 - `gemini-usage-widget/`: Gemini / Antigravity 사용량 미니 위젯 ([상세 안내](gemini-usage-widget/README.md))
+- `ai-usage-widget/`: Codex·Gemini 단일 창 전환형 통합 위젯 ([상세 안내](ai-usage-widget/README.md))
 
 ## 소스에서 실행 및 재시작
 
@@ -23,12 +25,14 @@ Codex(ChatGPT)와 Gemini(Antigravity) 사용량을 바탕화면에 작게 띄워
 
 - Codex 위젯: `start_codex_widget.bat`
 - Gemini 위젯: `start_gemini_widget.bat`
+- 통합 전환 위젯: `start_ai_widget.bat`
 
 직접 Python으로 실행할 수도 있습니다.
 
 ```powershell
 python codex-usage-widget\widget.py
 python gemini-usage-widget\widget.py
+python ai-usage-widget\widget.py
 ```
 
 ## 테스트
@@ -36,7 +40,7 @@ python gemini-usage-widget\widget.py
 저장소 루트에서 전체 단위 테스트를 한 번에 실행할 수 있습니다.
 
 ```powershell
-python -m unittest common/tests/test_common.py codex-usage-widget/tests/test_codex_widget.py gemini-usage-widget/tests/test_gemini_widget.py -v
+python -m unittest common/tests/test_common.py codex-usage-widget/tests/test_codex_widget.py gemini-usage-widget/tests/test_gemini_widget.py ai-usage-widget/tests/test_ai_widget.py -v
 ```
 
 ## 라이선스

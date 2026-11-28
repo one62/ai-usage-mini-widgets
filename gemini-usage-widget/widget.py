@@ -11,9 +11,9 @@ for _path in (str(_REPO_ROOT), str(_WIDGET_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from gemini_widget import FIVE_HOUR_TEXT, RUN_VALUE, WEEK_TEXT, UsageWidget, main
+from gemini_widget import RUN_VALUE, UsageWidget, main
 
-__all__ = ["FIVE_HOUR_TEXT", "RUN_VALUE", "WEEK_TEXT", "UsageWidget", "main"]
+__all__ = ["RUN_VALUE", "UsageWidget", "main"]
 
 
 if __name__ == "__main__":

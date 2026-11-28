@@ -282,6 +282,29 @@ class CommonHelpersTests(unittest.TestCase):
         widget._save_preferences()
         widget._save_widget_settings.assert_called_once()
 
+    def test_exit_by_user_disables_autostart_while_normal_close_keeps_it(self):
+        widget = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget.RUN_VALUE = "TestWidget"
+        widget._script_path = Path(r"C:\Widget\widget.py")
+        widget.autostart = mock.Mock()
+        widget.autostart.get.return_value = True
+        widget._close = mock.Mock()
+
+        with mock.patch("common.widget_base.set_autostart_for") as set_autostart:
+            widget._exit_by_user()
+        set_autostart.assert_called_once_with("TestWidget", widget._script_path, False)
+        widget.autostart.set.assert_called_once_with(False)
+        widget._close.assert_called_once_with()
+
+        # System/non-menu close must not touch autostart registration.
+        widget2 = BaseUsageWidget.__new__(BaseUsageWidget)
+        widget2._closing = False
+        widget2.root = mock.Mock()
+        widget2._save_preferences = mock.Mock()
+        with mock.patch("common.widget_base.set_autostart_for") as set_autostart:
+            widget2._close()
+        set_autostart.assert_not_called()
+
     def test_hover_polling_stops_when_hover_and_topmost_disabled(self):
         widget = BaseUsageWidget.__new__(BaseUsageWidget)
         widget.root = mock.Mock()
@@ -365,6 +388,37 @@ class CommonHelpersTests(unittest.TestCase):
             menu.entryconfigure(0, label="연결 상태: 로그인 필요", state="normal")
             menu._invoke(0)
             opened.assert_called_once_with()
+        finally:
+            root.destroy()
+
+    @unittest.skipUnless(os.name == "nt", "Requires Windows Tk")
+    def test_popup_menu_scale_snaps_to_resolution_and_formats_custom_values(self):
+        enable_dpi_awareness()
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            values = []
+            var = tk.IntVar(master=root, value=30)
+            menu = PopupMenu(root, lambda: None)
+            menu.add_scale(
+                label="투명도",
+                variable=var,
+                command=values.append,
+                from_=0,
+                to=100,
+                resolution=10,
+            )
+            menu.selected = 0
+            menu._adjust_scale(1)
+            self.assertEqual(var.get(), 40)
+            menu._adjust_scale(endpoint="max")
+            self.assertEqual(var.get(), 100)
+            menu._adjust_scale(endpoint="min")
+            self.assertEqual(var.get(), 0)
+
+            menu._scale_changed(0, "26")
+            self.assertEqual(menu.entries[0]["value_widget"].cget("text"), "30%")
+            self.assertEqual(values[-1], 30)
         finally:
             root.destroy()
 
@@ -489,6 +543,69 @@ class MouseGestureTests(unittest.TestCase):
         self.assertIsNone(widget.drag_origin)
         widget._move_widget.assert_not_called()
         widget._show_menu.assert_not_called()
+
+    def test_middle_click_passes_through_when_disabled(self):
+        widget = self.widget
+        widget._input_api = mock.Mock()
+        widget._input_api.CallNextHookEx.return_value = 42
+        widget._input_api.IsWindowVisible.return_value = 1
+        widget._input_hwnd = 1
+        widget._right_captured = False
+        widget._middle_captured = False
+        widget._menu_open = False
+        widget._on_middle_click = mock.Mock()
+
+        def rectangle(_hwnd, pointer):
+            pointer._obj.left, pointer._obj.top = 100, 100
+            pointer._obj.right, pointer._obj.bottom = 370, 138
+            return 1
+
+        widget._input_api.GetWindowRect.side_effect = rectangle
+        data = _MouseHookData()
+        data.pt.x, data.pt.y = 120, 120
+        self.assertEqual(widget._mouse_hook(0, 0x207, ctypes.addressof(data)), 42)
+        self.assertEqual(widget._mouse_hook(0, 0x208, ctypes.addressof(data)), 42)
+        widget._drain_mouse_events()
+        widget._on_middle_click.assert_not_called()
+
+    def test_middle_click_triggers_handler_only_when_enabled_and_released_inside(self):
+        widget = self.widget
+        widget.MIDDLE_CLICK_ENABLED = True
+        widget._input_api = mock.Mock()
+        widget._input_api.CallNextHookEx.return_value = 42
+        widget._input_api.IsWindowVisible.return_value = 1
+        widget._input_hwnd = 1
+        widget._right_captured = False
+        widget._middle_captured = False
+        widget._menu_open = False
+        widget._on_middle_click = mock.Mock()
+
+        def rectangle(_hwnd, pointer):
+            pointer._obj.left, pointer._obj.top = 100, 100
+            pointer._obj.right, pointer._obj.bottom = 370, 138
+            return 1
+
+        widget._input_api.GetWindowRect.side_effect = rectangle
+
+        def send(message, x=120, y=120):
+            data = _MouseHookData()
+            data.pt.x, data.pt.y = x, y
+            return widget._mouse_hook(0, message, ctypes.addressof(data))
+
+        self.assertEqual(send(0x207, 120, 120), 1)
+        self.assertTrue(widget._middle_captured)
+        self.assertEqual(send(0x208, 125, 125), 1)
+        self.assertFalse(widget._middle_captured)
+        widget._drain_mouse_events()
+        widget._on_middle_click.assert_called_once_with()
+
+        widget._on_middle_click.reset_mock()
+        self.assertEqual(send(0x207, 120, 120), 1)
+        self.assertTrue(widget._middle_captured)
+        self.assertEqual(send(0x208, 500, 500), 1)
+        self.assertFalse(widget._middle_captured)
+        widget._drain_mouse_events()
+        widget._on_middle_click.assert_not_called()
 
     def test_destroy_unhooks_only_for_root(self):
         self.widget._hook_thread = mock.Mock()

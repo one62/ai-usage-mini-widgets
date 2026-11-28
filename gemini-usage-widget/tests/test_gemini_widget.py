@@ -22,6 +22,7 @@ import antigravity_discovery
 from common.widget_base import (
     FONT_FAMILY,
     MUTED,
+    TEXT,
     TRACK,
     YELLOW,
     enable_dpi_awareness,
@@ -46,11 +47,7 @@ from gemini_usage import (
     parse_user_quota,
     query_usage,
 )
-from gemini_widget import (
-    FIVE_HOUR_TEXT,
-    WEEK_TEXT,
-    UsageWidget,
-)
+from gemini_widget import UsageWidget
 
 
 class ParseUserQuotaTests(unittest.TestCase):
@@ -685,17 +682,15 @@ class ParseUserQuotaTests(unittest.TestCase):
 
 
 class WidgetHelpersTests(unittest.TestCase):
-    def test_render_uses_wk_label_distinct_font_colors_and_gradient_meters(self):
-        self.assertEqual(FIVE_HOUR_TEXT, "#A5E9C1")
-        self.assertEqual(WEEK_TEXT, "#D2B8FF")
-        self.assertNotEqual(FIVE_HOUR_TEXT, WEEK_TEXT)
-
+    def test_render_updates_title_value_and_meter_colors_from_usage(self):
         widget = UsageWidget.__new__(UsageWidget)
         widget.root = mock.Mock()
         widget.root.after_idle.side_effect = lambda callback: callback()
+        widget.five_title = mock.Mock()
         widget.five_label = mock.Mock()
         widget.reset_compact = mock.Mock()
         widget.five_meter = mock.Mock()
+        widget.week_title = mock.Mock()
         widget.week_label = mock.Mock()
         widget.week_reset = mock.Mock()
         widget.week_meter = mock.Mock()
@@ -718,16 +713,20 @@ class WidgetHelpersTests(unittest.TestCase):
         )
         widget._render(snapshot)
 
-        widget.five_label.configure.assert_called_with(text="40%", fg=FIVE_HOUR_TEXT)
-        widget.week_label.configure.assert_called_with(text="80%", fg=WEEK_TEXT)
+        five_color = usage_color(40)
+        week_color = usage_color(80)
+        widget.five_title.configure.assert_called_with(fg=five_color)
+        widget.five_label.configure.assert_called_with(text="40%", fg=five_color)
+        widget.week_title.configure.assert_called_with(fg=week_color)
+        widget.week_label.configure.assert_called_with(text="80%", fg=week_color)
         five_fills = [
             call.kwargs["fill"] for call in widget.five_meter.create_rectangle.call_args_list
         ]
         week_fills = [
             call.kwargs["fill"] for call in widget.week_meter.create_rectangle.call_args_list
         ]
-        self.assertEqual(five_fills, [usage_color(40)] * 2 + [TRACK] * 3)
-        self.assertEqual(week_fills, [usage_color(80)] * 4 + [TRACK])
+        self.assertEqual(five_fills, [five_color] * 2 + [TRACK] * 3)
+        self.assertEqual(week_fills, [week_color] * 4 + [TRACK])
 
         widget.five_meter.reset_mock()
         widget.week_meter.reset_mock()
@@ -743,8 +742,10 @@ class WidgetHelpersTests(unittest.TestCase):
                 fetched_at=1_000_000.0,
             )
         )
-        widget.five_label.configure.assert_called_with(text="—%", fg=FIVE_HOUR_TEXT)
-        widget.week_label.configure.assert_called_with(text="—%", fg=WEEK_TEXT)
+        widget.five_title.configure.assert_called_with(fg=TEXT)
+        widget.five_label.configure.assert_called_with(text="—%", fg=TEXT)
+        widget.week_title.configure.assert_called_with(fg=TEXT)
+        widget.week_label.configure.assert_called_with(text="—%", fg=TEXT)
         self.assertEqual(
             [call.kwargs["fill"] for call in widget.five_meter.create_rectangle.call_args_list],
             [TRACK] * 5,

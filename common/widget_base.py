@@ -85,6 +85,7 @@ class BaseUsageWidget:
 
     APP_TITLE = "Usage"
     RUN_VALUE = ""
+    MIDDLE_CLICK_ENABLED = False
 
     def _init_base(self, *, script_path: Path) -> None:
         enable_dpi_awareness()
@@ -176,6 +177,9 @@ class BaseUsageWidget:
         return False
 
     def _open_app(self) -> None:
+        pass
+
+    def _on_middle_click(self) -> None:
         pass
 
     def _render(self, snapshot) -> None:
@@ -395,9 +399,11 @@ class BaseUsageWidget:
         header.pack_propagate(True)
         self.header = header
 
+        self.logo_label: tk.Label | None = None
         try:
             self._logo_image = tk.PhotoImage(master=self.root, file=str(logo_path))
-            tk.Label(header, image=self._logo_image, bg=BG, bd=0).pack(side="left", padx=(2, 4))
+            self.logo_label = tk.Label(header, image=self._logo_image, bg=BG, bd=0)
+            self.logo_label.pack(side="left", padx=(2, 4))
         except tk.TclError:
             pass
 
@@ -515,7 +521,14 @@ class BaseUsageWidget:
         )
 
     def _add_common_preference_menu_items(self, menu: PopupMenu) -> None:
-        menu.add_scale(label="투명도", variable=self.transparency, command=self._set_transparency)
+        menu.add_scale(
+            label="투명도",
+            variable=self.transparency,
+            command=self._set_transparency,
+            from_=0,
+            to=100,
+            resolution=10,
+        )
         menu.add_checkbutton(
             label="마우스를 올리면 투명도 80%",
             variable=self.hover_transparency_enabled,
@@ -598,6 +611,16 @@ class BaseUsageWidget:
         else:
             self._last_saved_state = current_state
 
+    def _exit_by_user(self) -> None:
+        if getattr(self, "autostart", None) is not None and self.autostart.get():
+            try:
+                set_autostart_for(self.RUN_VALUE, self._script_path, False)
+            except OSError:
+                pass
+            else:
+                self.autostart.set(False)
+        self._close()
+
     def _close(self) -> None:
         if self._closing:
             return
@@ -670,6 +693,7 @@ class BaseUsageWidget:
         self._input_hwnd = api.GetAncestor(self.root.winfo_id(), 2)  # GA_ROOT
         self._mouse_events = queue.SimpleQueue()
         self._right_captured = False
+        self._middle_captured = False
         self._menu_open = False
         self._menu_hwnd = None
         self._dragged = False
@@ -757,7 +781,7 @@ class BaseUsageWidget:
             return self._input_api.CallNextHookEx(None, code, message, data)
         if message == 0x200 and not self._right_captured:
             return self._input_api.CallNextHookEx(None, code, message, data)
-        if message in (0x200, 0x201, 0x204, 0x205, 0x207, 0x20B):
+        if message in (0x200, 0x201, 0x204, 0x205, 0x207, 0x208, 0x20B):
             point = ctypes.cast(data, ctypes.POINTER(_MouseHookData)).contents.pt
             x, y = point.x, point.y
             if self._menu_open:
@@ -786,6 +810,30 @@ class BaseUsageWidget:
                     return 1
                 if message == 0x200:
                     self._mouse_events.put(("move", x, y))
+            elif getattr(self, "MIDDLE_CLICK_ENABLED", False):
+                if message == 0x207:  # WM_MBUTTONDOWN
+                    if getattr(self, "_middle_captured", False):
+                        self._middle_captured = False
+                    rect = _Rect()
+                    if (
+                        self._input_api.IsWindowVisible(self._input_hwnd)
+                        and self._input_api.GetWindowRect(self._input_hwnd, ctypes.byref(rect))
+                        and rect.left <= x < rect.right
+                        and rect.top <= y < rect.bottom
+                    ):
+                        self._middle_captured = True
+                        return 1
+                elif message == 0x208 and getattr(self, "_middle_captured", False):  # WM_MBUTTONUP
+                    self._middle_captured = False
+                    rect = _Rect()
+                    if (
+                        self._input_api.IsWindowVisible(self._input_hwnd)
+                        and self._input_api.GetWindowRect(self._input_hwnd, ctypes.byref(rect))
+                        and rect.left <= x < rect.right
+                        and rect.top <= y < rect.bottom
+                    ):
+                        self._mouse_events.put(("middle_click", x, y))
+                    return 1
         return self._input_api.CallNextHookEx(None, code, message, data)
 
     def _dismiss_menu_outside(self, x: int, y: int) -> None:
@@ -818,6 +866,8 @@ class BaseUsageWidget:
                 pending_move = None
             if action == "dismiss":
                 self.menu.close()
+            elif action == "middle_click":
+                self._on_middle_click()
             elif action == "cancel":
                 self.drag_origin = None
             elif action == "down":
@@ -839,6 +889,7 @@ class BaseUsageWidget:
         active = (
             self.drag_origin is not None
             or getattr(self, "_right_captured", False)
+            or getattr(self, "_middle_captured", False)
             or getattr(self, "_menu_open", False)
         )
         self.root.after(10 if active else 50, self._drain_mouse_events)

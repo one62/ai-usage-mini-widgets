@@ -126,7 +126,7 @@ class UsageWidget(BaseUsageWidget):
         self._add_common_preference_menu_items(self.menu)
         self.menu.add_separator()
         self.menu.add_command(label="ChatGPT 데스크톱 열기", command=self._open_chatgpt)
-        self.menu.add_command(label="종료", command=self._close)
+        self.menu.add_command(label="종료", command=self._exit_by_user)
         self._fit_content_width()
 
     def _open_chatgpt(self) -> None:
